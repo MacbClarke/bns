@@ -1,3 +1,12 @@
+//! Admin HTTP server and API.
+//!
+//! Provides:
+//! - Static Web UI from `./web/` (served as fallback service),
+//! - JSON API under `/api/*` for managing rules and inspecting logs.
+//!
+//! All database calls are executed via `spawn_blocking` to keep the async runtime
+//! responsive.
+
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
@@ -19,22 +28,31 @@ use crate::{
     store::{QueryLogRow, Store},
 };
 
+/// Dependencies required by the web server.
 pub struct WebServerDeps {
+    /// Admin bind + optional auth token.
     pub admin: AdminConfig,
+    /// Log retention used by the manual cleanup endpoint.
     pub retention_days: i64,
     pub store: Arc<Store>,
     pub rules: Arc<RuleSet>,
 }
 
+/// Admin web server.
 pub struct WebServer {
     deps: WebServerDeps,
 }
 
 impl WebServer {
+    /// Create a new server instance.
     pub fn new(deps: WebServerDeps) -> Self {
         Self { deps }
     }
 
+    /// Run the server until shutdown is requested.
+    ///
+    /// - Serves `/api/*` with optional bearer-token auth.
+    /// - Serves static UI for all other paths.
     pub async fn run(self, shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         let state = AppState {
             admin: self.deps.admin.clone(),
@@ -75,6 +93,9 @@ struct AppState {
     rules: Arc<RuleSet>,
 }
 
+/// Optional bearer-token authentication for `/api/*`.
+///
+/// If `admin.token` is unset/empty, the API is open.
 async fn auth_middleware(
     State(state): State<AppState>,
     req: Request<axum::body::Body>,
@@ -96,6 +117,7 @@ async fn auth_middleware(
     next.run(req).await
 }
 
+/// Basic liveness endpoint.
 async fn api_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
 }
@@ -148,6 +170,9 @@ fn default_true() -> bool {
     true
 }
 
+/// Create a new rule.
+///
+/// This writes to SQLite and then refreshes the in-memory rule set.
 async fn api_rules_create(
     State(state): State<AppState>,
     Json(req): Json<CreateRuleReq>,
@@ -177,6 +202,7 @@ async fn api_rules_create(
     Ok((StatusCode::CREATED, Json(serde_json::json!({ "id": id }))))
 }
 
+/// Delete a rule by id.
 async fn api_rules_delete(
     State(state): State<AppState>,
     Path(id): Path<i64>,
@@ -225,6 +251,9 @@ fn default_limit() -> u32 {
     200
 }
 
+/// List query logs with filtering + pagination.
+///
+/// `from_ts/to_ts` must be RFC3339 strings (e.g. from browser `toISOString()`).
 async fn api_logs_list(
     State(state): State<AppState>,
     Query(q): Query<LogsQuery>,
@@ -246,6 +275,7 @@ async fn api_logs_list(
     Ok(Json(rows))
 }
 
+/// Manually trigger log cleanup according to configured retention days.
 async fn api_cleanup(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
     let store = state.store.clone();
     let retention_days = state.retention_days;

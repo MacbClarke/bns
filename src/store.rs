@@ -1,3 +1,18 @@
+//! SQLite persistence layer.
+//!
+//! Responsibilities:
+//! - store and manage rule definitions,
+//! - store query logs for later inspection,
+//! - periodically delete old logs according to retention policy.
+//!
+//! Notes:
+//! - We use a single `rusqlite::Connection` protected by a `Mutex`. This keeps
+//!   the implementation simple and is sufficient for an admin/logging workload.
+//! - All database calls are blocking; callers should prefer `spawn_blocking`
+//!   from async contexts (see `dns.rs` and `web.rs`).
+//! - Query log time filtering is based on `ts_unix_ms` (numeric milliseconds),
+//!   to avoid subtle issues with string time comparisons.
+
 use std::{path::Path, sync::Mutex};
 
 use rusqlite::{params, Connection};
@@ -5,12 +20,18 @@ use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::{config::BootstrapRule, rules::{MatchKind, Rule, RuleType}};
 
+/// SQLite store wrapper.
+///
+/// The underlying `Connection` is not thread-safe, so we guard it with a `Mutex`.
 #[derive(Debug)]
 pub struct Store {
     conn: Mutex<Connection>,
 }
 
 impl Store {
+    /// Open (and create if needed) the SQLite database file.
+    ///
+    /// Also configures WAL mode for better concurrent read/write behavior.
     pub fn open(path: &str) -> anyhow::Result<Self> {
         let p = Path::new(path);
         if let Some(parent) = p.parent() {
@@ -24,6 +45,11 @@ impl Store {
         })
     }
 
+    /// Create required tables and indexes.
+    ///
+    /// Important:
+    /// - This project treats schema mismatches as fatal (no migration logic).
+    /// - If you change the schema, you must delete the existing sqlite file.
     pub fn init_schema(&self) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
@@ -75,6 +101,10 @@ impl Store {
         Ok(())
     }
 
+    /// Insert `bootstrap_rules` only if the rules table is currently empty.
+    ///
+    /// This provides a convenient way to ship a default rule set without
+    /// overwriting user-managed rules in an existing database.
     pub fn maybe_bootstrap_rules(&self, bootstrap: &[BootstrapRule]) -> anyhow::Result<()> {
         if bootstrap.is_empty() {
             return Ok(());
@@ -106,6 +136,7 @@ impl Store {
         Ok(())
     }
 
+    /// Load all rules from the database.
     pub fn load_rules(&self) -> anyhow::Result<Vec<Rule>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -139,6 +170,7 @@ impl Store {
         Ok(out)
     }
 
+    /// Insert a single rule and return its row id.
     pub fn insert_rule(
         &self,
         match_kind: MatchKind,
@@ -168,12 +200,14 @@ impl Store {
         Ok(conn.last_insert_rowid())
     }
 
+    /// Delete a rule by id.
     pub fn delete_rule(&self, id: i64) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute("DELETE FROM rules WHERE id = ?1", params![id])?;
         Ok(())
     }
 
+    /// Enable/disable a rule by id.
     pub fn set_rule_enabled(&self, id: i64, enabled: bool) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -183,6 +217,7 @@ impl Store {
         Ok(())
     }
 
+    /// Insert a DNS query log row.
     pub fn insert_query_log(&self, entry: QueryLogEntry<'_>) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
@@ -208,6 +243,7 @@ impl Store {
         Ok(())
     }
 
+    /// Delete query logs older than `retention_days`.
     pub fn cleanup_query_logs(&self, retention_days: i64) -> anyhow::Result<u64> {
         let cutoff = OffsetDateTime::now_utc() - Duration::days(retention_days.max(0));
         let cutoff_ms: i64 = (cutoff.unix_timestamp_nanos() / 1_000_000)
@@ -219,6 +255,15 @@ impl Store {
         Ok(affected as u64)
     }
 
+    /// List query logs with optional filters and pagination.
+    ///
+    /// Filters:
+    /// - `from_ts` / `to_ts`: RFC3339 timestamps (e.g. from browser `toISOString()`).
+    /// - `qname_like`: SQL LIKE pattern (e.g. `%example.com.%`).
+    /// - `client_ip`: exact string match.
+    ///
+    /// Pagination:
+    /// - `limit` and `offset` are applied after filtering and sorting by newest first.
     pub fn list_query_logs(
         &self,
         from_ts: Option<&str>,
@@ -281,6 +326,9 @@ impl Store {
     }
 }
 
+/// Borrowed query log row for insertion.
+///
+/// `ts` is RFC3339 for readability; `ts_unix_ms` is used for stable numeric filtering.
 pub struct QueryLogEntry<'a> {
     pub ts: &'a str,
     pub ts_unix_ms: i64,
@@ -296,6 +344,7 @@ pub struct QueryLogEntry<'a> {
     pub answers_json: Option<&'a str>,
 }
 
+/// Returned query log row (for API/UI).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryLogRow {
     pub id: i64,
@@ -312,6 +361,7 @@ pub struct QueryLogRow {
     pub answers_json: Option<String>,
 }
 
+/// Convert rule match kind into the canonical DB string.
 fn match_kind_to_str(k: MatchKind) -> &'static str {
     match k {
         MatchKind::Exact => "exact",
@@ -320,6 +370,7 @@ fn match_kind_to_str(k: MatchKind) -> &'static str {
     }
 }
 
+/// Parse DB string into a rule match kind.
 fn match_kind_from_str(s: &str) -> Option<MatchKind> {
     match s {
         "exact" => Some(MatchKind::Exact),
@@ -329,6 +380,7 @@ fn match_kind_from_str(s: &str) -> Option<MatchKind> {
     }
 }
 
+/// Convert rule type into the canonical DB string.
 fn rule_type_to_str(t: RuleType) -> &'static str {
     match t {
         RuleType::A => "A",
@@ -337,6 +389,7 @@ fn rule_type_to_str(t: RuleType) -> &'static str {
     }
 }
 
+/// Parse DB string into a rule type.
 fn rule_type_from_str(s: &str) -> Option<RuleType> {
     match s {
         "A" => Some(RuleType::A),
@@ -346,6 +399,10 @@ fn rule_type_from_str(s: &str) -> Option<RuleType> {
     }
 }
 
+/// Ensure the `query_log` table matches the expected schema.
+///
+/// We intentionally do not try to migrate old schemas. If this check fails,
+/// the program instructs the operator to delete the sqlite DB and restart.
 fn verify_query_log_schema(conn: &Connection) -> anyhow::Result<()> {
     let mut stmt = conn.prepare("PRAGMA table_info(query_log)")?;
     let mut rows = stmt.query([])?;
@@ -366,6 +423,7 @@ fn verify_query_log_schema(conn: &Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse RFC3339 timestamp string into Unix milliseconds.
 fn parse_rfc3339_ms(s: &str) -> Option<i64> {
     // Accept RFC3339 from the WebUI (`toISOString`) and from internal logs.
     let dt = OffsetDateTime::parse(s, &Rfc3339).ok()?;

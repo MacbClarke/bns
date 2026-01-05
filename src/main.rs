@@ -1,6 +1,16 @@
+//! BNS - a small DNS forwarder with caching and Web UI.
+//!
+//! Entrypoint responsibilities:
+//! - load configuration from file/env,
+//! - initialize SQLite schema,
+//! - construct shared components (rules/cache/singleflight),
+//! - run DNS server and admin web server concurrently,
+//! - handle SIGTERM/SIGINT for graceful shutdown (important for Docker).
+
 mod cache;
 mod config;
 mod dns;
+mod inflight;
 mod rules;
 mod shutdown;
 mod store;
@@ -10,6 +20,12 @@ use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 use tracing::{error, info};
 
+/// Resolve config path from CLI args or environment.
+///
+/// Precedence:
+/// 1) `--config <path>`
+/// 2) `BNS_CONFIG` env var
+/// 3) `config.yaml` in current working directory
 fn config_path_from_args() -> PathBuf {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -24,6 +40,11 @@ fn config_path_from_args() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("config.yaml"))
 }
 
+/// Main entrypoint.
+///
+/// Starts both servers and waits until:
+/// - a shutdown signal arrives, or
+/// - either server task terminates (error or normal exit).
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -42,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     let rules = Arc::new(rules::RuleSet::load_from_store(store.clone())?);
     let cache = Arc::new(cache::DnsCache::new(config.cache.clone()));
+    let inflight = Arc::new(inflight::InFlight::new());
 
     let dns_bind: SocketAddr = config.listen.addr;
     let admin_bind: SocketAddr = config.admin.addr;
@@ -53,6 +75,7 @@ async fn main() -> anyhow::Result<()> {
         cache: cache.clone(),
         rules: rules.clone(),
         store: store.clone(),
+        inflight: inflight.clone(),
     });
 
     let web_server = web::WebServer::new(web::WebServerDeps {
@@ -114,6 +137,9 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Wait for an OS shutdown signal.
+///
+/// On Linux/Docker, `docker stop` sends `SIGTERM`, so we explicitly listen for it.
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
     {

@@ -1,3 +1,18 @@
+//! DNS server implementation (UDP + TCP) with:
+//! - forwarding to upstream resolvers,
+//! - in-memory caching,
+//! - rule-based local answers (A/AAAA/CNAME),
+//! - query logging (async to SQLite),
+//! - singleflight to de-duplicate concurrent upstream fetches,
+//! - optional stale-while-revalidate for expired cache entries.
+//!
+//! Design notes:
+//! - The hot path (`handle_query`) is fully async; the only blocking work
+//!   (SQLite writes) is pushed onto a background channel + `spawn_blocking`.
+//! - Cache keys are `(qname_normalized, qtype)` and do not include EDNS/ECS/etc.
+//! - Singleflight ensures that when the cache is cold, N concurrent identical
+//!   queries produce only one upstream request; the rest await the shared result.
+
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
@@ -22,23 +37,32 @@ use tracing::{debug, warn};
 use crate::{
     cache::{CacheKey, DnsCache},
     config::{Config, UpstreamPolicy},
+    inflight::InFlight,
     rules::{RuleAnswer, RuleSet, RuleType},
     store::{QueryLogEntry, Store},
 };
 
+/// Dependencies shared by all DNS handlers.
+///
+/// This is passed into each UDP packet task / TCP connection task and cloned
+/// (cheaply) using `Arc` references.
 pub struct DnsServerDeps {
     pub config: Config,
     pub cache: Arc<DnsCache>,
     pub rules: Arc<RuleSet>,
     pub store: Arc<Store>,
+    pub(crate) inflight: Arc<InFlight<CacheKey, Arc<UpstreamResult>>>,
 }
 
+/// DNS server entrypoint: binds UDP/TCP sockets and spawns request handlers.
 pub struct DnsServer {
     deps: DnsServerDeps,
+    /// Counter used to choose upstream in round-robin mode.
     rr_counter: Arc<AtomicUsize>,
 }
 
 impl DnsServer {
+    /// Create a new DNS server instance.
     pub fn new(deps: DnsServerDeps) -> Self {
         Self {
             deps,
@@ -46,6 +70,15 @@ impl DnsServer {
         }
     }
 
+    /// Run the server until shutdown is requested.
+    ///
+    /// This spawns:
+    /// - one UDP receive loop (if enabled),
+    /// - one TCP accept loop (if enabled),
+    /// - one background log worker.
+    ///
+    /// Each UDP packet is handled in its own task; each TCP connection is
+    /// handled in its own task.
     pub async fn run(self, shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
         let (log_tx, log_rx) = mpsc::channel::<LogEvent>(50_000);
         self.spawn_log_worker(log_rx, shutdown.clone());
@@ -80,6 +113,13 @@ impl DnsServer {
         Ok(())
     }
 
+    /// Spawn a background worker that writes query logs to SQLite.
+    ///
+    /// Important:
+    /// - Request handlers only do a `try_send` into the channel. If the channel
+    ///   is full, the log entry is dropped (to avoid impacting DNS latency).
+    /// - SQLite work runs in `spawn_blocking` to keep the async runtime responsive.
+    /// - Cleanup (retention) is executed at most once per hour.
     fn spawn_log_worker(
         &self,
         mut log_rx: mpsc::Receiver<LogEvent>,
@@ -121,10 +161,17 @@ impl Clone for DnsServerDeps {
             cache: self.cache.clone(),
             rules: self.rules.clone(),
             store: self.store.clone(),
+            inflight: self.inflight.clone(),
         }
     }
 }
 
+/// UDP receive loop.
+///
+/// Reads datagrams, then spawns a per-packet task that:
+/// - parses the query,
+/// - answers from rules / cache / upstream,
+/// - sends the response back to the client.
 async fn run_udp(
     socket: Arc<UdpSocket>,
     deps: DnsServerDeps,
@@ -146,7 +193,7 @@ async fn run_udp(
         let rr_counter = rr_counter.clone();
         tokio::spawn(async move {
             if let Some(resp) =
-                handle_query(packet, peer, "udp", deps, log_tx, rr_counter.as_ref()).await
+                handle_query(packet, peer, "udp", deps, log_tx, rr_counter).await
             {
                 let _ = socket.send_to(&resp, peer).await;
             }
@@ -155,6 +202,10 @@ async fn run_udp(
     Ok(())
 }
 
+/// TCP accept loop.
+///
+/// Accepts connections and spawns a per-connection task. The connection task
+/// reads length-prefixed DNS messages and answers them sequentially.
 async fn run_tcp(
     listener: TcpListener,
     deps: DnsServerDeps,
@@ -173,7 +224,7 @@ async fn run_tcp(
         let rr_counter = rr_counter.clone();
         tokio::spawn(async move {
             if let Err(e) =
-                handle_tcp_client(stream, peer, deps, log_tx, rr_counter.as_ref()).await
+                handle_tcp_client(stream, peer, deps, log_tx, rr_counter).await
             {
                 debug!(error = %e, "tcp client error");
             }
@@ -182,12 +233,16 @@ async fn run_tcp(
     Ok(())
 }
 
+/// Handle a single TCP client connection (multiple DNS messages).
+///
+/// DNS-over-TCP uses a 2-byte length prefix. We keep reading messages until
+/// EOF or parse/read error.
 async fn handle_tcp_client(
     mut stream: TcpStream,
     peer: SocketAddr,
     deps: DnsServerDeps,
     log_tx: mpsc::Sender<LogEvent>,
-    rr_counter: &AtomicUsize,
+    rr_counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     loop {
         let mut len_buf = [0u8; 2];
@@ -198,7 +253,10 @@ async fn handle_tcp_client(
         let mut msg_buf = vec![0u8; len];
         stream.read_exact(&mut msg_buf).await?;
 
-        if let Some(resp) = handle_query(msg_buf, peer, "tcp", deps.clone(), log_tx.clone(), rr_counter).await {
+        if let Some(resp) =
+            handle_query(msg_buf, peer, "tcp", deps.clone(), log_tx.clone(), rr_counter.clone())
+                .await
+        {
             let resp_len: u16 = resp.len().try_into().unwrap_or(u16::MAX);
             stream.write_all(&resp_len.to_be_bytes()).await?;
             stream.write_all(&resp[..resp_len as usize]).await?;
@@ -208,13 +266,28 @@ async fn handle_tcp_client(
     }
 }
 
+/// Handle one DNS query message and produce a wire-format response.
+///
+/// Core behavior:
+/// 1) Parse request and extract `(qname, qtype)`.
+/// 2) If a local rule matches, synthesize a response (no caching).
+/// 3) Else, try cache (fresh hit).
+/// 4) Else, if SWR is enabled, try "stale" cache; if present, return it
+///    immediately and refresh the cache in background.
+/// 5) Else, perform an upstream fetch. This is protected by `inflight` to
+///    de-duplicate concurrent cache misses for the same key.
+///
+/// Notes:
+/// - Cache hits rewrite the response ID and TTLs.
+/// - Upstream results are shared across waiting callers; each caller rewrites
+///   the response ID to match its request.
 async fn handle_query(
     packet: Vec<u8>,
     peer: SocketAddr,
     transport: &'static str,
     deps: DnsServerDeps,
     log_tx: mpsc::Sender<LogEvent>,
-    rr_counter: &AtomicUsize,
+    rr_counter: Arc<AtomicUsize>,
 ) -> Option<Vec<u8>> {
     let start = Instant::now();
     let client_ip = match peer.ip() {
@@ -249,16 +322,36 @@ async fn handle_query(
         if let Some(cached) = deps.cache.get(&key, id) {
             cache_hit = true;
             Some(cached)
+        } else if let Some(stale) = deps.cache.get_stale(&key, id) {
+            cache_hit = true;
+            // refresh in background (singleflight de-dupes)
+            let deps2 = deps.clone();
+            let inflight2 = deps2.inflight.clone();
+            let key2 = key.clone();
+            let packet2 = packet.clone();
+            let rr_counter2 = rr_counter.clone();
+            tokio::spawn(async move {
+                inflight2
+                    .run_if_absent(key2.clone(), || async move {
+                        fetch_and_cache(&deps2, key2, transport, packet2, rr_counter2).await
+                    })
+                    .await;
+            });
+            Some(stale)
         } else {
-            let (upstream, resp) =
-                forward_to_upstream(&deps, transport, &packet, rr_counter).await?;
-            upstream_used = Some(upstream);
-
-            if let Ok(msg) = Message::from_vec(&resp) {
-                let ttl = ttl_for_cache(&deps.cache, &msg);
-                deps.cache.put(key, &resp, ttl);
+            match deps
+                .inflight
+                .run_or_join(key.clone(), || async {
+                    fetch_and_cache(&deps, key, transport, packet.clone(), rr_counter.clone()).await
+                })
+                .await
+            {
+                Ok(res) => {
+                    upstream_used = Some(res.upstream.clone());
+                    rewrite_response_id(res.response.as_slice(), id).ok()
+                }
+                Err(_) => None,
             }
-            Some(resp)
         }
     }?;
 
@@ -291,6 +384,62 @@ async fn handle_query(
     Some(response)
 }
 
+/// Result of a single upstream fetch, shared across concurrent waiters.
+///
+/// `response` is the raw wire message received from upstream. Callers must
+/// rewrite the DNS ID for their own request before sending it to clients.
+#[derive(Debug, Clone)]
+pub(crate) struct UpstreamResult {
+    upstream: String,
+    response: Arc<Vec<u8>>,
+}
+
+/// Fetch from upstream and populate cache (if eligible).
+///
+/// - Uses configured upstream policy (failover/round-robin/random).
+/// - Parses the response to compute TTL for caching.
+/// - `SERVFAIL` is intentionally *not* cached (to avoid extending transient failures).
+///
+/// Returned value is an `Arc` so multiple callers (singleflight waiters) can
+/// cheaply share the same bytes.
+async fn fetch_and_cache(
+    deps: &DnsServerDeps,
+    key: CacheKey,
+    transport: &'static str,
+    packet: Vec<u8>,
+    rr_counter: Arc<AtomicUsize>,
+) -> anyhow::Result<Arc<UpstreamResult>> {
+    let (upstream, resp) =
+        forward_to_upstream(deps, transport, &packet, rr_counter.as_ref()).await
+            .ok_or_else(|| anyhow::anyhow!("upstream failed"))?;
+
+    if let Ok(msg) = Message::from_vec(&resp) {
+        if msg.response_code() != ResponseCode::ServFail {
+            let ttl = ttl_for_cache(&deps.cache, &msg);
+            deps.cache.put(key, &resp, ttl);
+        }
+    }
+
+    Ok(Arc::new(UpstreamResult {
+        upstream,
+        response: Arc::new(resp),
+    }))
+}
+
+/// Rewrite the DNS ID of a wire response.
+///
+/// This is required when a cached or shared upstream response is reused for a
+/// different request: DNS uses the message ID to match responses to requests.
+fn rewrite_response_id(response: &[u8], request_id: u16) -> anyhow::Result<Vec<u8>> {
+    let mut msg = Message::from_vec(response)?;
+    msg.set_id(request_id);
+    Ok(msg.to_vec()?)
+}
+
+/// Map a DNS question into the internal rule type.
+///
+/// We only support rules for A/AAAA/CNAME. All other qtypes return `None`,
+/// which means "no local rule match possible, continue with cache/upstream".
 fn rule_match(rules: &RuleSet, qname: &str, qtype: RecordType) -> Option<(i64, RuleAnswer)> {
     let rt = match qtype {
         RecordType::A => RuleType::A,
@@ -301,6 +450,13 @@ fn rule_match(rules: &RuleSet, qname: &str, qtype: RecordType) -> Option<(i64, R
     rules.find_answer(qname, rt)
 }
 
+/// Build a synthetic DNS response from a local rule answer.
+///
+/// Important details:
+/// - Sets QR=Response, Opcode=Query.
+/// - Marks recursion available (RA=true) to behave like a normal resolver.
+/// - Copies the original question section.
+/// - Adds exactly one answer record.
 fn build_rule_response(req: &Message, ans: RuleAnswer) -> anyhow::Result<Vec<u8>> {
     let mut resp = Message::new();
     resp.set_id(req.id());
@@ -339,6 +495,16 @@ fn build_rule_response(req: &Message, ans: RuleAnswer) -> anyhow::Result<Vec<u8>
     Ok(resp.to_vec()?)
 }
 
+/// Try upstream resolvers in configured order and return the first success.
+///
+/// Selection behavior:
+/// - `failover`: start from the first upstream and try sequentially.
+/// - `round_robin`: choose a rotating start index to spread load.
+/// - `random`: choose a pseudo-random start index.
+///
+/// Reliability behavior:
+/// - Each attempt is bounded by `timeout_ms`.
+/// - On error, tries the next upstream.
 async fn forward_to_upstream(
     deps: &DnsServerDeps,
     transport: &'static str,
@@ -381,6 +547,7 @@ async fn forward_to_upstream(
     None
 }
 
+/// Forward a DNS query to an upstream over UDP and read the response.
 async fn forward_udp(upstream: SocketAddr, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
     let socket = UdpSocket::bind("0.0.0.0:0").await?;
     socket.send_to(packet, upstream).await?;
@@ -391,6 +558,9 @@ async fn forward_udp(upstream: SocketAddr, packet: &[u8]) -> anyhow::Result<Vec<
     Ok(buf)
 }
 
+/// Forward a DNS query to an upstream over TCP and read the response.
+///
+/// DNS-over-TCP uses a 2-byte big-endian length prefix.
 async fn forward_tcp(upstream: SocketAddr, packet: &[u8]) -> anyhow::Result<Vec<u8>> {
     let mut stream = TcpStream::connect(upstream).await?;
     let len: u16 = packet.len().try_into().unwrap_or(u16::MAX);
@@ -405,6 +575,15 @@ async fn forward_tcp(upstream: SocketAddr, packet: &[u8]) -> anyhow::Result<Vec<
     Ok(resp)
 }
 
+/// Derive a cache TTL (seconds) from an upstream response.
+///
+/// Current policy:
+/// - If rcode is `NOERROR` or `NXDOMAIN`:
+///   - If there are answers, take the minimum TTL across the answer section.
+///   - If there are no answers, treat as negative caching and use `negative_ttl`.
+/// - For other rcodes (SERVFAIL, REFUSED, etc.): use `negative_ttl`.
+///
+/// Note that `SERVFAIL` is later filtered to *not* be cached at all.
 fn ttl_for_cache(cache: &DnsCache, msg: &Message) -> u64 {
     let rcode = msg.response_code();
     if rcode != ResponseCode::NoError && rcode != ResponseCode::NXDomain {
@@ -425,6 +604,9 @@ fn ttl_for_cache(cache: &DnsCache, msg: &Message) -> u64 {
     }
 }
 
+/// Create a small JSON representation of the answer section for UI/logging.
+///
+/// Only A/AAAA/CNAME are included; other RR types are ignored.
 fn summarize_answers_json(msg: &Message) -> anyhow::Result<String> {
     #[derive(serde::Serialize)]
     struct Answer {
@@ -457,6 +639,9 @@ fn summarize_answers_json(msg: &Message) -> anyhow::Result<String> {
     Ok(serde_json::to_string(&out)?)
 }
 
+/// A single query log event sent from the request path to the background log worker.
+///
+/// The `ts_unix_ms` field is used for stable numeric range filtering.
 struct LogEvent {
     ts: String,
     ts_unix_ms: i64,
@@ -473,6 +658,7 @@ struct LogEvent {
 }
 
 impl LogEvent {
+    /// Convert to the SQLite insertion struct (borrowed fields).
     fn as_entry(&self) -> QueryLogEntry<'_> {
         QueryLogEntry {
             ts: &self.ts,

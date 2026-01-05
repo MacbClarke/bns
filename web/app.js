@@ -1,26 +1,37 @@
+// BNS WebUI logic.
+// - Uses fetch() to call `/api/*` endpoints.
+// - Stores admin token in localStorage.
+// - Renders rules and query logs.
+// - Implements infinite scroll for logs (IntersectionObserver + offset paging).
+
 const tokenInput = document.getElementById("token");
 const saveTokenBtn = document.getElementById("saveToken");
 const authErrorEl = document.getElementById("authError");
 const authStatusEl = document.getElementById("authStatus");
 
+// Read admin token from localStorage.
 function loadToken() {
   return localStorage.getItem("bns_token") || "";
 }
+// Save admin token to localStorage.
 function saveToken(t) {
   localStorage.setItem("bns_token", t || "");
 }
+// Display an auth error message next to the token input.
 function setAuthError(msg) {
   if (!authErrorEl) return;
   const m = String(msg || "");
   authErrorEl.textContent = m;
   authErrorEl.style.display = m ? "inline" : "none";
 }
+// Display a short status message (e.g. after saving token).
 function setAuthStatus(msg) {
   if (!authStatusEl) return;
   const m = String(msg || "");
   authStatusEl.textContent = m;
   authStatusEl.style.display = m ? "inline" : "none";
 }
+// Normalize different error shapes into "is this unauthorized?".
 function isUnauthorized(e) {
   if (!e) return false;
   if (e.unauthorized === true) return true;
@@ -28,11 +39,13 @@ function isUnauthorized(e) {
   if (typeof e.message === "string" && e.message.startsWith("401 ")) return true;
   return false;
 }
+// Build Authorization header if token exists.
 function authHeaders() {
   const t = loadToken();
   if (!t) return {};
   return { Authorization: `Bearer ${t}` };
 }
+// Build a query string, skipping empty values.
 function qs(params) {
   const u = new URLSearchParams();
   for (const [k, v] of Object.entries(params)) {
@@ -43,6 +56,12 @@ function qs(params) {
   return s ? `?${s}` : "";
 }
 
+// Call JSON API under `/api`.
+//
+// Important behavior:
+// - On 401, do NOT alert; instead show the message near the token input and throw
+//   a marked error so callers can silently abort UI updates.
+// - On success, clears auth error/status.
 async function api(path, options = {}) {
   const headers = {
     "Content-Type": "application/json",
@@ -69,6 +88,7 @@ async function api(path, options = {}) {
   return res.text();
 }
 
+// Simple notification (used for non-auth errors and cleanup result).
 function toast(msg) {
   alert(msg);
 }
@@ -135,6 +155,7 @@ function renderRules(rules) {
   }
 }
 
+// Fetch and render rules list.
 async function refreshRules() {
   try {
     const rules = await api("/rules");
@@ -185,6 +206,7 @@ let logsLoading = false;
 let logsDone = false;
 let logsQueryKey = "";
 
+// Append log rows to the table.
 function renderLogs(rows) {
   for (const r of rows) {
     const answers = r.answers_json ? safeParseJson(r.answers_json) : [];
@@ -209,6 +231,7 @@ function renderLogs(rows) {
   }
 }
 
+// Current logs filter values (converted to server-friendly RFC3339).
 function currentLogsQuery() {
   const fromTs = toRfc3339FromDateTimeLocal(logFromTs.value);
   const toTs = toRfc3339FromDateTimeLocalEnd(logToTs.value);
@@ -221,6 +244,11 @@ function currentLogsQuery() {
 }
 
 async function loadMoreLogs() {
+  // Fetch the next page of logs and append to the table.
+  //
+  // This function is idempotent w.r.t. concurrent calls:
+  // - `logsLoading` prevents overlapping fetches
+  // - `logsDone` stops once the server returns fewer than `LOG_PAGE_SIZE` rows
   if (logsLoading || logsDone) return;
   logsLoading = true;
   try {
@@ -244,6 +272,10 @@ async function loadMoreLogs() {
 }
 
 async function refreshLogs(reset = true) {
+  // Refresh logs, optionally resetting pagination state.
+  //
+  // We hash the current filter into `logsQueryKey`; when filters change we reset
+  // offset and clear the table.
   const key = JSON.stringify(currentLogsQuery());
   if (reset || key !== logsQueryKey) {
     logsQueryKey = key;
@@ -267,6 +299,7 @@ cleanupLogsBtn.addEventListener("click", async () => {
   }
 });
 
+// Escape user/content values before inserting into innerHTML.
 function escapeHtml(s) {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -276,6 +309,7 @@ function escapeHtml(s) {
     .replaceAll("'", "&#039;");
 }
 
+// Parse JSON safely; if parsing fails, return the original string.
 function safeParseJson(s) {
   try {
     return JSON.parse(s);
@@ -284,6 +318,7 @@ function safeParseJson(s) {
   }
 }
 
+// Convert `datetime-local` value to RFC3339 (UTC) for the server.
 function toRfc3339FromDateTimeLocal(v) {
   if (!v) return "";
   const d = parseDateTimeLocal(v);
@@ -291,6 +326,11 @@ function toRfc3339FromDateTimeLocal(v) {
   return d.toISOString();
 }
 
+// Convert "to" time to RFC3339 (UTC), treating minute-level values as inclusive.
+//
+// HTML `datetime-local` commonly only provides minute precision (`YYYY-MM-DDTHH:mm`).
+// Users typically expect "to 10:30" to include values within that minute, so we
+// convert it to 10:30:59.999 local time before encoding.
 function toRfc3339FromDateTimeLocalEnd(v) {
   if (!v) return "";
   const d = parseDateTimeLocal(v);
@@ -302,6 +342,10 @@ function toRfc3339FromDateTimeLocalEnd(v) {
   return d.toISOString();
 }
 
+// Parse `datetime-local` value as local time.
+//
+// We avoid `new Date("YYYY-MM-DDTHH:mm")` because browsers differ on whether that
+// string is parsed as local time or UTC.
 function parseDateTimeLocal(v) {
   // Avoid browser differences around `new Date("YYYY-MM-DDTHH:mm")` parsing.
   // Parse as local time explicitly.
@@ -321,6 +365,9 @@ function parseDateTimeLocal(v) {
   return d;
 }
 
+// Format server timestamp (RFC3339) to the browser's local time zone.
+//
+// The raw timestamp is preserved in the `title` attribute of the table cell.
 function formatTsLocal(ts) {
   if (!ts) return "";
   const d = new Date(ts);
@@ -341,6 +388,7 @@ refreshRules();
 refreshLogs(true);
 
 if (logsSentinel && "IntersectionObserver" in window) {
+  // Infinite scroll for logs: when the sentinel reaches the viewport, fetch next page.
   const io = new IntersectionObserver(
     (entries) => {
       for (const ent of entries) {

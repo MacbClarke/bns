@@ -25,6 +25,10 @@ cache:
   min_ttl: 5
   max_ttl: 86400
   negative_ttl: 60
+  # If enabled, when cache is expired but within `stale_max_age`,
+  # serve a stale response immediately and refresh in background.
+  stale_while_revalidate: false
+  stale_max_age: 60
 
 # Optional: inserted into DB only if DB has no rules.
 bootstrap_rules:

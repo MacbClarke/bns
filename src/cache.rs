@@ -1,3 +1,18 @@
+//! In-memory DNS response cache.
+//!
+//! Stores whole wire-format DNS responses (as bytes) in an LRU keyed by:
+//! - normalized qname (lowercase + trailing dot),
+//! - qtype (u16).
+//!
+//! On cache hit, we rewrite:
+//! - the DNS message ID to match the current request,
+//! - the TTLs to represent the remaining lifetime.
+//!
+//! Optional stale-while-revalidate (SWR):
+//! - When enabled, expired entries are kept for an additional `stale_max_age`.
+//! - During that window, we may serve the stale response (TTL=0) and refresh
+//!   asynchronously in the background.
+
 use std::sync::Mutex;
 
 use hickory_proto::op::Message;
@@ -6,9 +21,12 @@ use time::{Duration, OffsetDateTime};
 
 use crate::config::CacheConfig;
 
+/// Cache key for a DNS question.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CacheKey {
+    /// Normalized domain name: lowercase + trailing dot.
     pub qname: String,
+    /// DNS record type as integer (e.g. A=1, AAAA=28).
     pub qtype: u16,
 }
 
@@ -16,6 +34,7 @@ pub struct CacheKey {
 struct CacheEntry {
     response: Vec<u8>,
     expires_at: OffsetDateTime,
+    stale_until: OffsetDateTime,
 }
 
 #[derive(Debug)]
@@ -25,6 +44,7 @@ pub struct DnsCache {
 }
 
 impl DnsCache {
+    /// Create a new cache with a fixed maximum entry count.
     pub fn new(cfg: CacheConfig) -> Self {
         let cap = std::num::NonZeroUsize::new(cfg.max_entries.max(1)).unwrap();
         Self {
@@ -33,12 +53,20 @@ impl DnsCache {
         }
     }
 
+    /// Get a fresh cached response.
+    ///
+    /// Returns `None` if:
+    /// - there is no entry, or
+    /// - the entry has expired.
+    ///
+    /// Returned bytes have:
+    /// - the request ID rewritten, and
+    /// - TTLs rewritten to the remaining TTL.
     pub fn get(&self, key: &CacheKey, request_id: u16) -> Option<Vec<u8>> {
         let now = OffsetDateTime::now_utc();
         let mut cache = self.inner.lock().unwrap();
         let entry = cache.get(key)?.clone();
         if entry.expires_at <= now {
-            cache.pop(key);
             return None;
         }
 
@@ -52,11 +80,42 @@ impl DnsCache {
         rewrite_response_id_and_ttl(&entry.response, request_id, remaining_secs).ok()
     }
 
+    /// Get a stale cached response (SWR), if enabled.
+    ///
+    /// A stale response may be served when:
+    /// - `stale_while_revalidate` is enabled,
+    /// - the entry is expired (`expires_at <= now`),
+    /// - but still within the stale window (`now < stale_until`).
+    ///
+    /// Stale responses are returned with TTL=0.
+    pub fn get_stale(&self, key: &CacheKey, request_id: u16) -> Option<Vec<u8>> {
+        if !self.cfg.stale_while_revalidate {
+            return None;
+        }
+        let now = OffsetDateTime::now_utc();
+        let mut cache = self.inner.lock().unwrap();
+        let entry = cache.get(key)?.clone();
+        if entry.expires_at > now {
+            return None;
+        }
+        if entry.stale_until <= now {
+            cache.pop(key);
+            return None;
+        }
+        rewrite_response_id_and_ttl(&entry.response, request_id, 0).ok()
+    }
+
+    /// Insert/replace a cache entry.
+    ///
+    /// The provided TTL is clamped to `[min_ttl, max_ttl]` (and forced to >= 1).
+    /// If SWR is enabled, the stale window is set to `expires_at + stale_max_age`.
     pub fn put(&self, key: CacheKey, response: &[u8], ttl_secs: u64) {
         let ttl_secs = ttl_secs
             .clamp(self.cfg.min_ttl, self.cfg.max_ttl)
             .max(1);
         let expires_at = OffsetDateTime::now_utc() + Duration::seconds(ttl_secs as i64);
+        let stale_until =
+            expires_at + Duration::seconds(self.cfg.stale_max_age.max(0) as i64);
 
         let mut cache = self.inner.lock().unwrap();
         cache.put(
@@ -64,15 +123,22 @@ impl DnsCache {
             CacheEntry {
                 response: response.to_vec(),
                 expires_at,
+                stale_until,
             },
         );
     }
 
+    /// Negative caching TTL to apply when there is no positive answer TTL to use.
     pub fn negative_ttl(&self) -> u64 {
         self.cfg.negative_ttl
     }
 }
 
+/// Rewrite response ID and TTLs for a cached/stale response.
+///
+/// We set the same TTL for all records in answer/authority/additional sections.
+/// This is a simplification that works well for typical resolver caching, but
+/// it does not preserve per-record TTL differences.
 fn rewrite_response_id_and_ttl(
     response: &[u8],
     request_id: u16,
@@ -93,4 +159,3 @@ fn rewrite_response_id_and_ttl(
 
     Ok(msg.to_vec()?)
 }
-
