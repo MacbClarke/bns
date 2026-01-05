@@ -1,0 +1,37 @@
+listen:
+  addr: "0.0.0.0:53"
+  udp: true
+  tcp: true
+
+admin:
+  addr: "0.0.0.0:8080"
+  # If set, /api requires `Authorization: Bearer <token>`
+  token: "change-me"
+
+storage:
+  path: "./data/bns.sqlite"
+  retention_days: 7
+
+upstreams:
+  - "223.5.5.5:53"
+  - "1.1.1.1:53"
+  # IPv6 upstream example:
+  # - "[2606:4700:4700::1111]:53"
+upstream_policy: "failover" # failover | round_robin | random
+timeout_ms: 2000
+
+cache:
+  max_entries: 200000
+  min_ttl: 5
+  max_ttl: 86400
+  negative_ttl: 60
+
+# Optional: inserted into DB only if DB has no rules.
+bootstrap_rules:
+  - match_kind: "exact"
+    name: "example.com."
+    rr_type: "A"
+    value: "10.0.0.10"
+    ttl: 60
+    priority: 100
+    enabled: true

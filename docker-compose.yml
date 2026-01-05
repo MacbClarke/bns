@@ -1,0 +1,13 @@
+services:
+  bns:
+    build: .
+    container_name: bns
+    restart: unless-stopped
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+      - "8080:8080/tcp"
+    volumes:
+      - ./config.yaml:/config/config.yaml:ro
+      - ./data:/app/data
+
