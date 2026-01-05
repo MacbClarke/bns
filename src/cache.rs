@@ -35,6 +35,9 @@ struct CacheEntry {
     response: Vec<u8>,
     expires_at: OffsetDateTime,
     stale_until: OffsetDateTime,
+    /// Exponentially-decayed hit counter used for adaptive stale windows.
+    heat: f64,
+    heat_updated_at: OffsetDateTime,
 }
 
 #[derive(Debug)]
@@ -92,23 +95,37 @@ impl DnsCache {
     pub fn get(&self, key: &CacheKey, request_id: u16) -> Option<Vec<u8>> {
         let now = OffsetDateTime::now_utc();
         let mut cache = self.inner.lock().unwrap();
-        let entry = cache.get(key)?.clone();
-        if entry.expires_at <= now {
+        let (expires_at, stale_until, response) = {
+            let entry = cache.get_mut(key)?;
+            let expires_at = entry.expires_at;
+            let stale_until = entry.stale_until;
+            if expires_at <= now {
+                (expires_at, stale_until, None)
+            } else {
+                if self.cfg.stale_while_revalidate {
+                    self.bump_heat_on_hit(entry, now);
+                    let stale_age = self.stale_age_secs_for_heat(entry.heat);
+                    entry.stale_until = entry.expires_at + Duration::seconds(stale_age as i64);
+                }
+                (expires_at, entry.stale_until, Some(entry.response.clone()))
+            }
+        };
+
+        if expires_at <= now {
             // If SWR is disabled, or the stale window is over, evict immediately.
-            if !self.cfg.stale_while_revalidate || entry.stale_until <= now {
+            if !self.cfg.stale_while_revalidate || stale_until <= now {
                 cache.pop(key);
             }
             return None;
         }
 
-        let remaining = entry.expires_at - now;
-        let remaining_secs: u32 = remaining
-            .whole_seconds()
-            .try_into()
-            .unwrap_or(0)
-            .max(0);
+        let response = response?;
+        drop(cache);
 
-        rewrite_response_id_and_ttl(&entry.response, request_id, remaining_secs).ok()
+        let remaining = expires_at - now;
+        let remaining_secs: u32 = remaining.whole_seconds().try_into().unwrap_or(0).max(0);
+
+        rewrite_response_id_and_ttl(&response, request_id, remaining_secs).ok()
     }
 
     /// Get a stale cached response (SWR), if enabled.
@@ -125,15 +142,30 @@ impl DnsCache {
         }
         let now = OffsetDateTime::now_utc();
         let mut cache = self.inner.lock().unwrap();
-        let entry = cache.get(key)?.clone();
-        if entry.expires_at > now {
+        let (expires_at, stale_until, response) = {
+            let entry = cache.get_mut(key)?;
+            let expires_at = entry.expires_at;
+            let stale_until = entry.stale_until;
+            if expires_at > now {
+                (expires_at, stale_until, None)
+            } else if stale_until <= now {
+                (expires_at, stale_until, None)
+            } else {
+                // Count stale hits toward hotness, but do not extend the current stale window.
+                self.bump_heat_on_hit(entry, now);
+                (expires_at, stale_until, Some(entry.response.clone()))
+            }
+        };
+        if expires_at > now {
             return None;
         }
-        if entry.stale_until <= now {
+        if stale_until <= now {
             cache.pop(key);
             return None;
         }
-        rewrite_response_id_and_ttl(&entry.response, request_id, 0).ok()
+        let response = response?;
+        drop(cache);
+        rewrite_response_id_and_ttl(&response, request_id, 0).ok()
     }
 
     /// Snapshot cache keys and entry metadata for inspection in the admin UI.
@@ -166,10 +198,9 @@ impl DnsCache {
             let expires_unix_ms: i64 = (v.expires_at.unix_timestamp_nanos() / 1_000_000)
                 .try_into()
                 .unwrap_or(i64::MAX);
-            let stale_until_unix_ms: i64 =
-                (v.stale_until.unix_timestamp_nanos() / 1_000_000)
-                    .try_into()
-                    .unwrap_or(i64::MAX);
+            let stale_until_unix_ms: i64 = (v.stale_until.unix_timestamp_nanos() / 1_000_000)
+                .try_into()
+                .unwrap_or(i64::MAX);
             let remaining_ttl_secs = (v.expires_at - now).whole_seconds();
             let remaining_stale_secs = (v.stale_until - now).whole_seconds();
 
@@ -191,22 +222,31 @@ impl DnsCache {
     /// Insert/replace a cache entry.
     ///
     /// The provided TTL is clamped to `[min_ttl, max_ttl]` (and forced to >= 1).
-    /// If SWR is enabled, the stale window is set to `expires_at + stale_max_age`.
+    /// If SWR is enabled, the stale window is set to `expires_at + stale_max_age`
+    /// (or derived from hit frequency when `adaptive_stale` is enabled).
     pub fn put(&self, key: CacheKey, response: &[u8], ttl_secs: u64) {
-        let ttl_secs = ttl_secs
-            .clamp(self.cfg.min_ttl, self.cfg.max_ttl)
-            .max(1);
-        let expires_at = OffsetDateTime::now_utc() + Duration::seconds(ttl_secs as i64);
-        let stale_until =
-            expires_at + Duration::seconds(self.cfg.stale_max_age.max(0) as i64);
+        let ttl_secs = ttl_secs.clamp(self.cfg.min_ttl, self.cfg.max_ttl).max(1);
+        let now = OffsetDateTime::now_utc();
+        let expires_at = now + Duration::seconds(ttl_secs as i64);
 
         let mut cache = self.inner.lock().unwrap();
+        let (mut heat, mut heat_updated_at) = match cache.pop(&key) {
+            Some(old) => (old.heat, old.heat_updated_at),
+            None => (0.0, now),
+        };
+        heat = decay_heat(heat, heat_updated_at, now, self.cfg.stale_half_life_secs);
+        heat_updated_at = now;
+
+        let stale_age_secs = self.stale_age_secs_for_heat(heat);
+        let stale_until = expires_at + Duration::seconds(stale_age_secs as i64);
         cache.put(
             key,
             CacheEntry {
                 response: response.to_vec(),
                 expires_at,
                 stale_until,
+                heat,
+                heat_updated_at,
             },
         );
     }
@@ -215,6 +255,44 @@ impl DnsCache {
     pub fn negative_ttl(&self) -> u64 {
         self.cfg.negative_ttl
     }
+
+    fn bump_heat_on_hit(&self, entry: &mut CacheEntry, now: OffsetDateTime) {
+        entry.heat = decay_heat(
+            entry.heat,
+            entry.heat_updated_at,
+            now,
+            self.cfg.stale_half_life_secs,
+        ) + 1.0;
+        entry.heat_updated_at = now;
+    }
+
+    fn stale_age_secs_for_heat(&self, heat: f64) -> u64 {
+        let max_age = self.cfg.stale_max_age;
+        if max_age == 0 {
+            return 0;
+        }
+        let min_age = self.cfg.stale_min_age.min(max_age);
+        if max_age <= min_age {
+            return max_age;
+        }
+        let k = self.cfg.stale_hotness_k.max(1) as f64;
+        let h = heat.max(0.0);
+        let frac = h / (h + k);
+        let secs = min_age as f64 + (max_age - min_age) as f64 * frac;
+        secs.round().clamp(min_age as f64, max_age as f64) as u64
+    }
+}
+
+fn decay_heat(heat: f64, last: OffsetDateTime, now: OffsetDateTime, half_life_secs: u64) -> f64 {
+    if heat <= 0.0 {
+        return 0.0;
+    }
+    if half_life_secs == 0 {
+        return 0.0;
+    }
+    let dt_secs: f64 = (now - last).whole_seconds().max(0) as f64;
+    let hl: f64 = half_life_secs as f64;
+    heat * 2f64.powf(-dt_secs / hl)
 }
 
 /// Rewrite response ID and TTLs for a cached/stale response.

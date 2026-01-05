@@ -16,8 +16,8 @@
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
 
@@ -25,12 +25,12 @@ use hickory_proto::{
     op::{Message, MessageType, OpCode, ResponseCode},
     rr::{Name, RData, Record, RecordType},
 };
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream, UdpSocket},
     sync::{mpsc, watch},
-    time::{timeout, Duration, Instant},
+    time::{Duration, Instant, timeout},
 };
 use tracing::{debug, warn};
 
@@ -192,9 +192,7 @@ async fn run_udp(
         let log_tx = log_tx.clone();
         let rr_counter = rr_counter.clone();
         tokio::spawn(async move {
-            if let Some(resp) =
-                handle_query(packet, peer, "udp", deps, log_tx, rr_counter).await
-            {
+            if let Some(resp) = handle_query(packet, peer, "udp", deps, log_tx, rr_counter).await {
                 let _ = socket.send_to(&resp, peer).await;
             }
         });
@@ -223,9 +221,7 @@ async fn run_tcp(
         let log_tx = log_tx.clone();
         let rr_counter = rr_counter.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                handle_tcp_client(stream, peer, deps, log_tx, rr_counter).await
-            {
+            if let Err(e) = handle_tcp_client(stream, peer, deps, log_tx, rr_counter).await {
                 debug!(error = %e, "tcp client error");
             }
         });
@@ -253,9 +249,15 @@ async fn handle_tcp_client(
         let mut msg_buf = vec![0u8; len];
         stream.read_exact(&mut msg_buf).await?;
 
-        if let Some(resp) =
-            handle_query(msg_buf, peer, "tcp", deps.clone(), log_tx.clone(), rr_counter.clone())
-                .await
+        if let Some(resp) = handle_query(
+            msg_buf,
+            peer,
+            "tcp",
+            deps.clone(),
+            log_tx.clone(),
+            rr_counter.clone(),
+        )
+        .await
         {
             let resp_len: u16 = resp.len().try_into().unwrap_or(u16::MAX);
             stream.write_all(&resp_len.to_be_bytes()).await?;
@@ -412,9 +414,9 @@ async fn fetch_and_cache(
     packet: Vec<u8>,
     rr_counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<Arc<UpstreamResult>> {
-    let (upstream, resp) =
-        forward_to_upstream(deps, transport, &packet, rr_counter.as_ref()).await
-            .ok_or_else(|| anyhow::anyhow!("upstream failed"))?;
+    let (upstream, resp) = forward_to_upstream(deps, transport, &packet, rr_counter.as_ref())
+        .await
+        .ok_or_else(|| anyhow::anyhow!("upstream failed"))?;
 
     if let Ok(msg) = Message::from_vec(&resp) {
         if msg.response_code() != ResponseCode::ServFail {
@@ -473,16 +475,12 @@ fn build_rule_response(req: &Message, ans: RuleAnswer) -> anyhow::Result<Vec<u8>
         resp.add_query(q.clone());
         let name = q.name().clone();
         let record = match ans {
-            RuleAnswer::A { addr, ttl } => Record::from_rdata(
-                name,
-                ttl,
-                RData::A(hickory_proto::rr::rdata::A(addr)),
-            ),
-            RuleAnswer::AAAA { addr, ttl } => Record::from_rdata(
-                name,
-                ttl,
-                RData::AAAA(hickory_proto::rr::rdata::AAAA(addr)),
-            ),
+            RuleAnswer::A { addr, ttl } => {
+                Record::from_rdata(name, ttl, RData::A(hickory_proto::rr::rdata::A(addr)))
+            }
+            RuleAnswer::AAAA { addr, ttl } => {
+                Record::from_rdata(name, ttl, RData::AAAA(hickory_proto::rr::rdata::AAAA(addr)))
+            }
             RuleAnswer::CNAME { name: cname, ttl } => {
                 let cname = Name::from_utf8(&cname)?;
                 Record::from_rdata(
@@ -534,10 +532,12 @@ async fn forward_to_upstream(
         let upstream = upstreams[idx];
         let upstream_str = upstream.to_string();
         let res = match transport {
-            "tcp" => {
-                timeout(timeout_dur, forward_tcp(upstream, packet)).await.ok()?
-            }
-            _ => timeout(timeout_dur, forward_udp(upstream, packet)).await.ok()?,
+            "tcp" => timeout(timeout_dur, forward_tcp(upstream, packet))
+                .await
+                .ok()?,
+            _ => timeout(timeout_dur, forward_udp(upstream, packet))
+                .await
+                .ok()?,
         };
         match res {
             Ok(resp) => return Some((upstream_str, resp)),

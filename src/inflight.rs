@@ -134,4 +134,3 @@ async fn join_state<T: Clone>(state: Arc<State<T>>) -> anyhow::Result<T> {
             .map_err(|_| anyhow::anyhow!("inflight channel closed"))?;
     }
 }
-

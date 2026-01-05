@@ -29,6 +29,19 @@ cache:
   # serve a stale response immediately and refresh in background.
   stale_while_revalidate: false
   stale_max_age: 60
+  # Optional: adaptive stale window based on query frequency (hot keys get more stale).
+  # Only takes effect when `stale_while_revalidate: true`.
+  #
+  # stale_min_age: minimum stale window for cold keys (seconds). Higher => less upstream traffic,
+  #                but stale answers may be served for longer.
+  # stale_half_life_secs: hotness decay half-life (seconds). Smaller => "hot" cools faster and
+  #                       stale shrinks quickly; larger => past traffic keeps keys hot longer.
+  # stale_hotness_k: curve parameter controlling how fast stale grows with hotness. Roughly:
+  #                  when hotness ~= k, stale is ~halfway between `stale_min_age` and `stale_max_age`.
+  #                  Smaller k => fewer hits needed to get a large stale window; larger k => slower growth.
+  # stale_min_age: 0
+  # stale_half_life_secs: 300
+  # stale_hotness_k: 10
 
 # Optional: inserted into DB only if DB has no rules.
 bootstrap_rules:

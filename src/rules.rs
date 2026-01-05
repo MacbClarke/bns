@@ -158,9 +158,5 @@ fn rule_to_answer(rule: &Rule) -> Option<RuleAnswer> {
 /// - ensures a trailing dot (`example.com.`).
 pub fn normalize_name(name: &str) -> String {
     let s = name.trim().to_ascii_lowercase();
-    if s.ends_with('.') {
-        s
-    } else {
-        format!("{s}.")
-    }
+    if s.ends_with('.') { s } else { format!("{s}.") }
 }

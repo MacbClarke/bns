@@ -15,10 +15,13 @@
 
 use std::{path::Path, sync::Mutex};
 
-use rusqlite::{params, Connection};
-use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
+use rusqlite::{Connection, params};
+use time::{Duration, OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::{config::BootstrapRule, rules::{MatchKind, Rule, RuleType}};
+use crate::{
+    config::BootstrapRule,
+    rules::{MatchKind, Rule, RuleType},
+};
 
 /// SQLite store wrapper.
 ///
@@ -151,11 +154,21 @@ impl Store {
             let rr_type: String = row.get(3)?;
             Ok(Rule {
                 id: row.get(0)?,
-                match_kind: match_kind_from_str(&match_kind)
-                    .ok_or_else(|| rusqlite::Error::InvalidColumnType(1, "match_kind".into(), rusqlite::types::Type::Text))?,
+                match_kind: match_kind_from_str(&match_kind).ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(
+                        1,
+                        "match_kind".into(),
+                        rusqlite::types::Type::Text,
+                    )
+                })?,
                 name: row.get(2)?,
-                rr_type: rule_type_from_str(&rr_type)
-                    .ok_or_else(|| rusqlite::Error::InvalidColumnType(3, "rr_type".into(), rusqlite::types::Type::Text))?,
+                rr_type: rule_type_from_str(&rr_type).ok_or_else(|| {
+                    rusqlite::Error::InvalidColumnType(
+                        3,
+                        "rr_type".into(),
+                        rusqlite::types::Type::Text,
+                    )
+                })?,
                 value: row.get(4)?,
                 ttl: row.get::<_, i64>(5)? as u32,
                 priority: row.get(6)?,
@@ -250,8 +263,10 @@ impl Store {
             .try_into()
             .unwrap_or(i64::MIN);
         let conn = self.conn.lock().unwrap();
-        let affected =
-            conn.execute("DELETE FROM query_log WHERE ts_unix_ms < ?1", params![cutoff_ms])?;
+        let affected = conn.execute(
+            "DELETE FROM query_log WHERE ts_unix_ms < ?1",
+            params![cutoff_ms],
+        )?;
         Ok(affected as u64)
     }
 
@@ -458,9 +473,7 @@ fn verify_query_log_schema(conn: &Connection) -> anyhow::Result<()> {
         }
     }
     if !ok {
-        anyhow::bail!(
-            "incompatible sqlite schema for query_log; delete the sqlite db and restart"
-        );
+        anyhow::bail!("incompatible sqlite schema for query_log; delete the sqlite db and restart");
     }
     Ok(())
 }

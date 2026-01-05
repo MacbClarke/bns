@@ -10,18 +10,18 @@
 use std::{net::SocketAddr, sync::Arc};
 
 use axum::{
+    Json, Router,
     extract::{Path, Query, State},
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
-    Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use tower_http::services::ServeDir;
-use tokio::sync::watch;
-use tracing::info;
 use time::{Duration, OffsetDateTime};
+use tokio::sync::watch;
+use tower_http::services::ServeDir;
+use tracing::info;
 
 use crate::{
     cache::{CacheSnapshot, DnsCache},
@@ -75,7 +75,10 @@ impl WebServer {
             .route("/rules/{id}/enable", post(api_rules_enable))
             .route("/logs", get(api_logs_list))
             .route("/cleanup", post(api_cleanup))
-            .layer(middleware::from_fn_with_state(state.clone(), auth_middleware))
+            .layer(middleware::from_fn_with_state(
+                state.clone(),
+                auth_middleware,
+            ))
             .with_state(state.clone());
 
         let app = Router::new()

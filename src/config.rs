@@ -95,6 +95,15 @@ pub struct CacheConfig {
     /// How long an expired entry can be served as stale (seconds).
     #[serde(default = "default_cache_stale_max_age")]
     pub stale_max_age: u64,
+    /// Minimum stale window (seconds) used for adaptive stale window.
+    #[serde(default = "default_cache_stale_min_age")]
+    pub stale_min_age: u64,
+    /// Half-life (seconds) for the hotness score decay used for adaptive stale window.
+    #[serde(default = "default_cache_stale_half_life_secs")]
+    pub stale_half_life_secs: u64,
+    /// Hotness curve parameter (roughly: hits per half-life to reach ~50% of the range).
+    #[serde(default = "default_cache_stale_hotness_k")]
+    pub stale_hotness_k: u64,
 }
 
 impl Default for CacheConfig {
@@ -106,6 +115,9 @@ impl Default for CacheConfig {
             negative_ttl: default_cache_negative_ttl(),
             stale_while_revalidate: false,
             stale_max_age: default_cache_stale_max_age(),
+            stale_min_age: default_cache_stale_min_age(),
+            stale_half_life_secs: default_cache_stale_half_life_secs(),
+            stale_hotness_k: default_cache_stale_hotness_k(),
         }
     }
 }
@@ -124,6 +136,15 @@ fn default_cache_negative_ttl() -> u64 {
 }
 fn default_cache_stale_max_age() -> u64 {
     60
+}
+fn default_cache_stale_min_age() -> u64 {
+    0
+}
+fn default_cache_stale_half_life_secs() -> u64 {
+    300
+}
+fn default_cache_stale_hotness_k() -> u64 {
+    10
 }
 
 /// Persistent storage settings (SQLite).

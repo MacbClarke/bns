@@ -49,8 +49,7 @@ fn config_path_from_args() -> PathBuf {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -144,7 +143,7 @@ async fn main() -> anyhow::Result<()> {
 async fn wait_for_shutdown_signal() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate())?;
         let mut int = signal(SignalKind::interrupt())?;
         tokio::select! {
