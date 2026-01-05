@@ -1,30 +1,27 @@
 //! Singleflight-style de-duplication for concurrent async work.
 //!
-//! Motivation:
-//! - When many identical DNS queries arrive at the same time and the cache is cold,
-//!   we want to avoid sending N identical requests to the upstream resolver.
-//! - Instead, we run one upstream fetch per key and let other callers await the
-//!   same result.
+//! This is used to collapse concurrent cold-cache DNS queries into a single
+//! upstream request:
+//! - First caller becomes the "leader" and performs the work.
+//! - Other callers "join" and await the leader's result.
 //!
-//! This implementation stores a per-key shared state containing:
-//! - a `Notify` to wake waiters once the result is ready,
-//! - a `result` slot populated by the first caller that "wins" the race.
-//!
-//! Note: errors are stored as strings to keep the shared state `Clone`-friendly.
+//! Implementation notes:
+//! - We use a per-key `watch` channel to publish completion. `watch` is used
+//!   specifically because it is level-triggered: late subscribers will still
+//!   observe the last value and will not miss the completion signal.
+//! - This avoids subtle missed-wakeup issues that can occur with `Notify`
+//!   when waiters subscribe after a notification is fired.
 
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{Mutex, watch};
 
 #[derive(Debug)]
 struct State<T> {
-    notify: Notify,
-    result: Mutex<Option<Result<T, String>>>,
+    tx: watch::Sender<Option<Result<T, String>>>,
 }
 
 /// De-duplicate concurrent computations keyed by `K`.
-///
-/// Typical use: `run_or_join(key, || async { ... })`.
 #[derive(Debug)]
 pub struct InFlight<K, T> {
     inner: Mutex<HashMap<K, Arc<State<T>>>>,
@@ -46,84 +43,70 @@ where
     ///
     /// Detailed behavior:
     /// - The first caller to insert `key` into the internal map becomes the "leader".
-    /// - The leader executes `f()`, stores the result, removes the key from the map,
-    ///   and notifies all waiters.
-    /// - Waiters simply await the leader's notification and then clone the stored
-    ///   result.
-    ///
-    /// Guarantees:
-    /// - At most one `f()` runs at a time per key.
-    /// - After completion, the key is removed to avoid unbounded growth.
-    ///
-    /// Caveat:
-    /// - If the leader task is cancelled/panics before it stores a result, waiters
-    ///   could block. In this codebase, the leader is awaited within the DNS handler
-    ///   flow, so this is not expected in normal operation.
+    /// - The leader executes `f()`, broadcasts the result via `watch`, removes the key,
+    ///   and returns the result.
+    /// - Waiters subscribe to the `watch` channel and return the published result.
     pub async fn run_or_join<F, Fut>(&self, key: K, f: F) -> anyhow::Result<T>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
-        let state = {
+        // Fast path: is there already a leader?
+        let existing = {
+            let map = self.inner.lock().await;
+            map.get(&key).cloned()
+        };
+        if let Some(state) = existing {
+            return join_state(state).await;
+        }
+
+        // Try to become leader.
+        let (tx, _rx) = watch::channel::<Option<Result<T, String>>>(None);
+        let state = Arc::new(State { tx });
+
+        let became_leader = {
             let mut map = self.inner.lock().await;
-            if let Some(s) = map.get(&key) {
-                s.clone()
+            if let Some(existing) = map.get(&key) {
+                // Lost the race; join the existing leader.
+                Some(existing.clone())
             } else {
-                let s = Arc::new(State {
-                    notify: Notify::new(),
-                    result: Mutex::new(None),
-                });
-                map.insert(key.clone(), s.clone());
-                drop(map);
-
-                let res = f().await.map_err(|e| e.to_string());
-                *s.result.lock().await = Some(res);
-
-                let mut map = self.inner.lock().await;
-                map.remove(&key);
-                drop(map);
-
-                s.notify.notify_waiters();
-                return s
-                    .result
-                    .lock()
-                    .await
-                    .clone()
-                    .unwrap_or_else(|| Err("inflight missing result".into()))
-                    .map_err(|e| anyhow::anyhow!(e));
+                map.insert(key.clone(), state.clone());
+                None
             }
         };
+        if let Some(existing) = became_leader {
+            return join_state(existing).await;
+        }
 
-        state.notify.notified().await;
-        state
-            .result
-            .lock()
-            .await
-            .clone()
-            .unwrap_or_else(|| Err("inflight missing result".into()))
-            .map_err(|e| anyhow::anyhow!(e))
+        // Leader executes and publishes.
+        let res = f().await.map_err(|e| e.to_string());
+        let _ = state.tx.send(Some(res.clone()));
+
+        let mut map = self.inner.lock().await;
+        map.remove(&key);
+        drop(map);
+
+        res.map_err(|e| anyhow::anyhow!(e))
     }
 
-    /// Start `f` only if no in-flight exists; if one exists, returns immediately.
+    /// Start `f` only if no in-flight exists; otherwise return immediately.
     ///
-    /// This is used for stale-while-revalidate:
-    /// - If a refresh is already running for a key, do nothing.
-    /// - Otherwise, kick off the refresh once.
+    /// This is used for stale-while-revalidate background refresh: if a refresh
+    /// is already running for the key, we do nothing.
     pub async fn run_if_absent<F, Fut>(&self, key: K, f: F)
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = anyhow::Result<T>>,
     {
+        let (tx, _rx) = watch::channel::<Option<Result<T, String>>>(None);
+        let state = Arc::new(State { tx });
+
         let should_run = {
             let mut map = self.inner.lock().await;
             if map.contains_key(&key) {
                 false
             } else {
-                let s = Arc::new(State {
-                    notify: Notify::new(),
-                    result: Mutex::new(None),
-                });
-                map.insert(key.clone(), s);
+                map.insert(key.clone(), state.clone());
                 true
             }
         };
@@ -132,6 +115,23 @@ where
             return;
         }
 
-        let _ = self.run_or_join(key, f).await;
+        let res = f().await.map_err(|e| e.to_string());
+        let _ = state.tx.send(Some(res));
+
+        let mut map = self.inner.lock().await;
+        map.remove(&key);
     }
 }
+
+async fn join_state<T: Clone>(state: Arc<State<T>>) -> anyhow::Result<T> {
+    let mut rx = state.tx.subscribe();
+    loop {
+        if let Some(res) = rx.borrow().clone() {
+            return res.map_err(|e| anyhow::anyhow!(e));
+        }
+        rx.changed()
+            .await
+            .map_err(|_| anyhow::anyhow!("inflight channel closed"))?;
+    }
+}
+
