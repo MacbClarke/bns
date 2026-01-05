@@ -43,6 +43,33 @@ pub struct DnsCache {
     inner: Mutex<LruCache<CacheKey, CacheEntry>>,
 }
 
+/// A lightweight view of an in-memory cache entry for the admin UI/API.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheEntryInfo {
+    pub qname: String,
+    pub qtype: u16,
+    pub qtype_name: String,
+    pub state: CacheEntryState,
+    pub expires_unix_ms: i64,
+    pub stale_until_unix_ms: i64,
+    pub remaining_ttl_secs: i64,
+    pub remaining_stale_secs: i64,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CacheEntryState {
+    Fresh,
+    Stale,
+    Expired,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CacheSnapshot {
+    pub total: usize,
+    pub items: Vec<CacheEntryInfo>,
+}
+
 impl DnsCache {
     /// Create a new cache with a fixed maximum entry count.
     pub fn new(cfg: CacheConfig) -> Self {
@@ -67,6 +94,10 @@ impl DnsCache {
         let mut cache = self.inner.lock().unwrap();
         let entry = cache.get(key)?.clone();
         if entry.expires_at <= now {
+            // If SWR is disabled, or the stale window is over, evict immediately.
+            if !self.cfg.stale_while_revalidate || entry.stale_until <= now {
+                cache.pop(key);
+            }
             return None;
         }
 
@@ -103,6 +134,58 @@ impl DnsCache {
             return None;
         }
         rewrite_response_id_and_ttl(&entry.response, request_id, 0).ok()
+    }
+
+    /// Snapshot cache keys and entry metadata for inspection in the admin UI.
+    ///
+    /// This does not include response bytes, and it is safe to call even with a
+    /// large cache, but it is still O(n) w.r.t. `offset + limit` because we must
+    /// iterate the LRU to reach the requested page.
+    pub fn snapshot(&self, offset: usize, limit: usize) -> CacheSnapshot {
+        let now = OffsetDateTime::now_utc();
+        let cache = self.inner.lock().unwrap();
+        let total = cache.len();
+        let mut items = Vec::with_capacity(limit.min(1000));
+
+        for (idx, (k, v)) in cache.iter().enumerate() {
+            if idx < offset {
+                continue;
+            }
+            if items.len() >= limit {
+                break;
+            }
+
+            let state = if v.expires_at > now {
+                CacheEntryState::Fresh
+            } else if self.cfg.stale_while_revalidate && v.stale_until > now {
+                CacheEntryState::Stale
+            } else {
+                CacheEntryState::Expired
+            };
+
+            let expires_unix_ms: i64 = (v.expires_at.unix_timestamp_nanos() / 1_000_000)
+                .try_into()
+                .unwrap_or(i64::MAX);
+            let stale_until_unix_ms: i64 =
+                (v.stale_until.unix_timestamp_nanos() / 1_000_000)
+                    .try_into()
+                    .unwrap_or(i64::MAX);
+            let remaining_ttl_secs = (v.expires_at - now).whole_seconds();
+            let remaining_stale_secs = (v.stale_until - now).whole_seconds();
+
+            items.push(CacheEntryInfo {
+                qname: k.qname.clone(),
+                qtype: k.qtype,
+                qtype_name: format!("{:?}", hickory_proto::rr::RecordType::from(k.qtype)),
+                state,
+                expires_unix_ms,
+                stale_until_unix_ms,
+                remaining_ttl_secs,
+                remaining_stale_secs,
+            });
+        }
+
+        CacheSnapshot { total, items }
     }
 
     /// Insert/replace a cache entry.

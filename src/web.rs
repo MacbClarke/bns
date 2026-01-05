@@ -21,11 +21,13 @@ use serde::{Deserialize, Serialize};
 use tower_http::services::ServeDir;
 use tokio::sync::watch;
 use tracing::info;
+use time::{Duration, OffsetDateTime};
 
 use crate::{
+    cache::{CacheSnapshot, DnsCache},
     config::AdminConfig,
     rules::{MatchKind, RuleSet, RuleType},
-    store::{QueryLogRow, Store},
+    store::{QueryLogRow, QueryStats, Store},
 };
 
 /// Dependencies required by the web server.
@@ -34,6 +36,8 @@ pub struct WebServerDeps {
     pub admin: AdminConfig,
     /// Log retention used by the manual cleanup endpoint.
     pub retention_days: i64,
+    /// In-memory cache (for inspection APIs).
+    pub cache: Arc<DnsCache>,
     pub store: Arc<Store>,
     pub rules: Arc<RuleSet>,
 }
@@ -57,12 +61,15 @@ impl WebServer {
         let state = AppState {
             admin: self.deps.admin.clone(),
             retention_days: self.deps.retention_days,
+            cache: self.deps.cache.clone(),
             store: self.deps.store.clone(),
             rules: self.deps.rules.clone(),
         };
 
         let api = Router::new()
             .route("/health", get(api_health))
+            .route("/stats", get(api_stats))
+            .route("/cache", get(api_cache))
             .route("/rules", get(api_rules_list).post(api_rules_create))
             .route("/rules/{id}", delete(api_rules_delete))
             .route("/rules/{id}/enable", post(api_rules_enable))
@@ -89,6 +96,7 @@ impl WebServer {
 struct AppState {
     admin: AdminConfig,
     retention_days: i64,
+    cache: Arc<DnsCache>,
     store: Arc<Store>,
     rules: Arc<RuleSet>,
 }
@@ -120,6 +128,53 @@ async fn auth_middleware(
 /// Basic liveness endpoint.
 async fn api_health() -> impl IntoResponse {
     (StatusCode::OK, "ok")
+}
+
+/// Statistics for last 24 hours.
+///
+/// Returns JSON:
+/// - `total`: total queries handled
+/// - `cache_hit`: number of queries served from cache (fresh or stale)
+/// - `hit_rate`: `cache_hit/total`
+/// - `avg_latency_ms`: average response time (ms)
+async fn api_stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, StatusCode> {
+    let since = OffsetDateTime::now_utc() - Duration::hours(24);
+    let since_ms: i64 = (since.unix_timestamp_nanos() / 1_000_000)
+        .try_into()
+        .unwrap_or(i64::MIN);
+    let store = state.store.clone();
+    let stats: QueryStats = tokio::task::spawn_blocking(move || store.stats_since(since_ms))
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({
+        "window_hours": 24,
+        "total": stats.total,
+        "cache_hit": stats.cache_hit,
+        "hit_rate": stats.hit_rate(),
+        "avg_latency_ms": stats.avg_latency_ms
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct CacheQuery {
+    #[serde(default = "default_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+}
+
+/// In-memory cache snapshot.
+///
+/// Intended for admin inspection only; returns a page of cache keys and entry metadata.
+async fn api_cache(
+    State(state): State<AppState>,
+    Query(q): Query<CacheQuery>,
+) -> Result<Json<CacheSnapshot>, StatusCode> {
+    let limit = q.limit.min(2000) as usize;
+    let offset = q.offset as usize;
+    Ok(Json(state.cache.snapshot(offset, limit)))
 }
 
 #[derive(Serialize)]

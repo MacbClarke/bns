@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>BNS Admin - 规则</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title">BNS 管理</div>
+      <nav class="nav">
+        <a href="/stats.html" data-nav="stats">统计</a>
+        <a href="/rules.html" data-nav="rules">规则</a>
+        <a href="/logs.html" data-nav="logs">查询日志</a>
+      </nav>
+      <div class="auth">
+        <input id="token" type="password" placeholder="Admin token（Bearer）" />
+        <button id="saveToken">保存</button>
+        <span id="authError" class="authError" style="display:none;"></span>
+        <span id="authStatus" class="authStatus" style="display:none;"></span>
+      </div>
+    </header>
+
+    <main>
+      <section class="card" id="rulesCard">
+        <h2>规则（A / AAAA / CNAME）</h2>
+        <form id="createRule" class="grid">
+          <label>匹配
+            <select name="match_kind">
+              <option value="exact">exact</option>
+              <option value="suffix">suffix</option>
+              <option value="wildcard">wildcard</option>
+            </select>
+          </label>
+          <label>域名
+            <input name="name" placeholder="example.com." required />
+          </label>
+          <label>类型
+            <select name="rr_type">
+              <option value="A">A</option>
+              <option value="AAAA">AAAA</option>
+              <option value="CNAME">CNAME</option>
+            </select>
+          </label>
+          <label>值
+            <input name="value" placeholder="10.0.0.1 / ::1 / alias.example.com." required />
+          </label>
+          <label>TTL
+            <input name="ttl" type="number" min="1" value="60" required />
+          </label>
+          <label>优先级
+            <input name="priority" type="number" value="0" />
+          </label>
+          <div class="actions">
+            <button type="submit">新增规则</button>
+            <button type="button" id="refreshRules">刷新</button>
+          </div>
+        </form>
+        <div class="tableWrap">
+          <table id="rulesTable">
+            <thead>
+              <tr>
+                <th>ID</th>
+                <th>启用</th>
+                <th>匹配</th>
+                <th>域名</th>
+                <th>类型</th>
+                <th>值</th>
+                <th>TTL</th>
+                <th>优先级</th>
+                <th>操作</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
+

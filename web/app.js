@@ -93,211 +93,370 @@ function toast(msg) {
   alert(msg);
 }
 
-tokenInput.value = loadToken();
-saveTokenBtn.addEventListener("click", () => {
-  saveToken(tokenInput.value.trim());
-  setAuthError("");
-  setAuthStatus("已保存");
-  setTimeout(() => setAuthStatus(""), 1500);
-});
-
-// Rules
-const rulesTableBody = document.querySelector("#rulesTable tbody");
-const refreshRulesBtn = document.getElementById("refreshRules");
-const createRuleForm = document.getElementById("createRule");
-
-function renderRules(rules) {
-  rulesTableBody.innerHTML = "";
-  for (const r of rules) {
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${r.id}</td>
-      <td>${r.enabled ? "yes" : "no"}</td>
-      <td>${r.match_kind}</td>
-      <td>${escapeHtml(r.name)}</td>
-      <td>${r.rr_type}</td>
-      <td>${escapeHtml(r.value)}</td>
-      <td>${r.ttl}</td>
-      <td>${r.priority}</td>
-      <td class="rowActions"></td>
-    `;
-    const actions = tr.querySelector(".rowActions");
-    const toggle = document.createElement("button");
-    toggle.textContent = r.enabled ? "禁用" : "启用";
-    toggle.addEventListener("click", async () => {
-      try {
-        await api(`/rules/${r.id}/enable`, {
-          method: "POST",
-          body: JSON.stringify({ enabled: !r.enabled }),
-        });
-        await refreshRules();
-      } catch (e) {
-        if (isUnauthorized(e)) return;
-        toast(e.message);
-      }
-    });
-    const del = document.createElement("button");
-    del.textContent = "删除";
-    del.className = "danger";
-    del.addEventListener("click", async () => {
-      if (!confirm(`删除规则 ${r.id}?`)) return;
-      try {
-        await api(`/rules/${r.id}`, { method: "DELETE" });
-        await refreshRules();
-      } catch (e) {
-        if (isUnauthorized(e)) return;
-        toast(e.message);
-      }
-    });
-    actions.appendChild(toggle);
-    actions.appendChild(del);
-    rulesTableBody.appendChild(tr);
-  }
+function initAuth() {
+  if (!tokenInput || !saveTokenBtn) return;
+  tokenInput.value = loadToken();
+  saveTokenBtn.addEventListener("click", () => {
+    saveToken(tokenInput.value.trim());
+    setAuthError("");
+    setAuthStatus("已保存");
+    setTimeout(() => setAuthStatus(""), 1500);
+  });
 }
 
-// Fetch and render rules list.
-async function refreshRules() {
-  try {
-    const rules = await api("/rules");
-    renderRules(rules);
-  } catch (e) {
-    if (isUnauthorized(e)) return;
-    toast(e.message);
-  }
+function initNavActive() {
+  const path = location.pathname;
+  const active =
+    path.endsWith("/stats.html") || path.endsWith("stats.html")
+      ? "stats"
+      : path.endsWith("/rules.html") || path.endsWith("rules.html")
+      ? "rules"
+      : path.endsWith("/logs.html") || path.endsWith("logs.html")
+      ? "logs"
+      : "";
+  document.querySelectorAll("nav a[data-nav]").forEach((a) => {
+    if (a.getAttribute("data-nav") === active) a.classList.add("active");
+    else a.classList.remove("active");
+  });
 }
 
-refreshRulesBtn.addEventListener("click", refreshRules);
-createRuleForm.addEventListener("submit", async (ev) => {
-  ev.preventDefault();
-  const data = new FormData(createRuleForm);
-  const body = {
-    match_kind: data.get("match_kind"),
-    name: data.get("name"),
-    rr_type: data.get("rr_type"),
-    value: data.get("value"),
-    ttl: Number(data.get("ttl") || 60),
-    priority: Number(data.get("priority") || 0),
-  };
-  try {
-    await api("/rules", { method: "POST", body: JSON.stringify(body) });
-    createRuleForm.reset();
-    // restore defaults
-    createRuleForm.querySelector('[name="ttl"]').value = "60";
-    await refreshRules();
-  } catch (e) {
-    if (isUnauthorized(e)) return;
-    toast(e.message);
+function initRulesPage() {
+  const rulesCard = document.getElementById("rulesCard");
+  if (!rulesCard) return;
+
+  const rulesTableBody = document.querySelector("#rulesTable tbody");
+  const refreshRulesBtn = document.getElementById("refreshRules");
+  const createRuleForm = document.getElementById("createRule");
+
+  function renderRules(rules) {
+    rulesTableBody.innerHTML = "";
+    for (const r of rules) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td>${r.id}</td>
+        <td>${r.enabled ? "yes" : "no"}</td>
+        <td>${r.match_kind}</td>
+        <td>${escapeHtml(r.name)}</td>
+        <td>${r.rr_type}</td>
+        <td>${escapeHtml(r.value)}</td>
+        <td>${r.ttl}</td>
+        <td>${r.priority}</td>
+        <td class="rowActions"></td>
+      `;
+      const actions = tr.querySelector(".rowActions");
+      const toggle = document.createElement("button");
+      toggle.textContent = r.enabled ? "禁用" : "启用";
+      toggle.addEventListener("click", async () => {
+        try {
+          await api(`/rules/${r.id}/enable`, {
+            method: "POST",
+            body: JSON.stringify({ enabled: !r.enabled }),
+          });
+          await refreshRules();
+        } catch (e) {
+          if (isUnauthorized(e)) return;
+          toast(e.message);
+        }
+      });
+      const del = document.createElement("button");
+      del.textContent = "删除";
+      del.className = "danger";
+      del.addEventListener("click", async () => {
+        if (!confirm(`删除规则 ${r.id}?`)) return;
+        try {
+          await api(`/rules/${r.id}`, { method: "DELETE" });
+          await refreshRules();
+        } catch (e) {
+          if (isUnauthorized(e)) return;
+          toast(e.message);
+        }
+      });
+      actions.appendChild(toggle);
+      actions.appendChild(del);
+      rulesTableBody.appendChild(tr);
+    }
   }
-});
 
-// Logs
-const logsTableBody = document.querySelector("#logsTable tbody");
-const refreshLogsBtn = document.getElementById("refreshLogs");
-const cleanupLogsBtn = document.getElementById("cleanupLogs");
-const logsSentinel = document.getElementById("logsSentinel");
-const logFromTs = document.getElementById("logFromTs");
-const logToTs = document.getElementById("logToTs");
-const logQnameLike = document.getElementById("logQnameLike");
-const logClientIp = document.getElementById("logClientIp");
-
-const LOG_PAGE_SIZE = 200;
-let logsOffset = 0;
-let logsLoading = false;
-let logsDone = false;
-let logsQueryKey = "";
-
-// Append log rows to the table.
-function renderLogs(rows) {
-  for (const r of rows) {
-    const answers = r.answers_json ? safeParseJson(r.answers_json) : [];
-    const answersText = Array.isArray(answers)
-      ? answers.map((a) => `${a.rr_type} ${a.value} ttl=${a.ttl}`).join("; ")
-      : r.answers_json;
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td title="${escapeHtml(r.ts)}">${escapeHtml(formatTsLocal(r.ts))}</td>
-      <td>${escapeHtml(r.client_ip)}</td>
-      <td>${escapeHtml(r.transport)}</td>
-      <td>${escapeHtml(r.qname)}</td>
-      <td>${escapeHtml(r.qtype)}</td>
-      <td>${escapeHtml(r.rcode)}</td>
-      <td>${r.latency_ms}</td>
-      <td>${r.cache_hit ? "yes" : "no"}</td>
-      <td>${r.rule_hit ? "yes" : "no"}</td>
-      <td>${escapeHtml(r.upstream || "")}</td>
-      <td>${escapeHtml(answersText || "")}</td>
-    `;
-    logsTableBody.appendChild(tr);
+  async function refreshRules() {
+    try {
+      const rules = await api("/rules");
+      renderRules(rules);
+    } catch (e) {
+      if (isUnauthorized(e)) return;
+      toast(e.message);
+    }
   }
+
+  refreshRulesBtn.addEventListener("click", refreshRules);
+  createRuleForm.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const data = new FormData(createRuleForm);
+    const body = {
+      match_kind: data.get("match_kind"),
+      name: data.get("name"),
+      rr_type: data.get("rr_type"),
+      value: data.get("value"),
+      ttl: Number(data.get("ttl") || 60),
+      priority: Number(data.get("priority") || 0),
+    };
+    try {
+      await api("/rules", { method: "POST", body: JSON.stringify(body) });
+      createRuleForm.reset();
+      createRuleForm.querySelector('[name="ttl"]').value = "60";
+      await refreshRules();
+    } catch (e) {
+      if (isUnauthorized(e)) return;
+      toast(e.message);
+    }
+  });
+
+  refreshRules();
 }
 
-// Current logs filter values (converted to server-friendly RFC3339).
-function currentLogsQuery() {
-  const fromTs = toRfc3339FromDateTimeLocal(logFromTs.value);
-  const toTs = toRfc3339FromDateTimeLocalEnd(logToTs.value);
-  return {
-    from_ts: fromTs,
-    to_ts: toTs,
-    qname_like: logQnameLike.value.trim(),
-    client_ip: logClientIp.value.trim(),
-  };
-}
+function initLogsPage() {
+  const logsCard = document.getElementById("logsCard");
+  if (!logsCard) return;
 
-async function loadMoreLogs() {
-  // Fetch the next page of logs and append to the table.
-  //
-  // This function is idempotent w.r.t. concurrent calls:
-  // - `logsLoading` prevents overlapping fetches
-  // - `logsDone` stops once the server returns fewer than `LOG_PAGE_SIZE` rows
-  if (logsLoading || logsDone) return;
-  logsLoading = true;
-  try {
-    const base = currentLogsQuery();
-    const rows = await api(
-      `/logs${qs({
-        ...base,
-        limit: LOG_PAGE_SIZE,
-        offset: logsOffset,
-      })}`
+  const logsTableBody = document.querySelector("#logsTable tbody");
+  const refreshLogsBtn = document.getElementById("refreshLogs");
+  const cleanupLogsBtn = document.getElementById("cleanupLogs");
+  const logsSentinel = document.getElementById("logsSentinel");
+  const logFromTs = document.getElementById("logFromTs");
+  const logToTs = document.getElementById("logToTs");
+  const logQnameLike = document.getElementById("logQnameLike");
+  const logClientIp = document.getElementById("logClientIp");
+
+  const LOG_PAGE_SIZE = 200;
+  let logsOffset = 0;
+  let logsLoading = false;
+  let logsDone = false;
+  let logsQueryKey = "";
+
+  function renderLogs(rows) {
+    for (const r of rows) {
+      const answers = r.answers_json ? safeParseJson(r.answers_json) : [];
+      const answersText = Array.isArray(answers)
+        ? answers.map((a) => `${a.rr_type} ${a.value} ttl=${a.ttl}`).join("; ")
+        : r.answers_json;
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td title="${escapeHtml(r.ts)}">${escapeHtml(formatTsLocal(r.ts))}</td>
+        <td>${escapeHtml(r.client_ip)}</td>
+        <td>${escapeHtml(r.transport)}</td>
+        <td>${escapeHtml(r.qname)}</td>
+        <td>${escapeHtml(r.qtype)}</td>
+        <td>${escapeHtml(r.rcode)}</td>
+        <td>${r.latency_ms}</td>
+        <td>${r.cache_hit ? "yes" : "no"}</td>
+        <td>${r.rule_hit ? "yes" : "no"}</td>
+        <td>${escapeHtml(r.upstream || "")}</td>
+        <td>${escapeHtml(answersText || "")}</td>
+      `;
+      logsTableBody.appendChild(tr);
+    }
+  }
+
+  function currentLogsQuery() {
+    const fromTs = toRfc3339FromDateTimeLocal(logFromTs.value);
+    const toTs = toRfc3339FromDateTimeLocalEnd(logToTs.value);
+    return {
+      from_ts: fromTs,
+      to_ts: toTs,
+      qname_like: logQnameLike.value.trim(),
+      client_ip: logClientIp.value.trim(),
+    };
+  }
+
+  async function loadMoreLogs() {
+    if (logsLoading || logsDone) return;
+    logsLoading = true;
+    try {
+      const base = currentLogsQuery();
+      const rows = await api(
+        `/logs${qs({
+          ...base,
+          limit: LOG_PAGE_SIZE,
+          offset: logsOffset,
+        })}`
+      );
+      renderLogs(rows);
+      logsOffset += rows.length;
+      if (!rows || rows.length < LOG_PAGE_SIZE) logsDone = true;
+    } catch (e) {
+      if (isUnauthorized(e)) return;
+      toast(e.message);
+    } finally {
+      logsLoading = false;
+    }
+  }
+
+  async function refreshLogs(reset = true) {
+    const key = JSON.stringify(currentLogsQuery());
+    if (reset || key !== logsQueryKey) {
+      logsQueryKey = key;
+      logsOffset = 0;
+      logsLoading = false;
+      logsDone = false;
+      logsTableBody.innerHTML = "";
+    }
+    await loadMoreLogs();
+  }
+
+  refreshLogsBtn.addEventListener("click", () => refreshLogs(true));
+  cleanupLogsBtn.addEventListener("click", async () => {
+    try {
+      const res = await api("/cleanup", { method: "POST", body: "{}" });
+      toast(`已删除 ${res.deleted} 条`);
+      await refreshLogs(true);
+    } catch (e) {
+      if (isUnauthorized(e)) return;
+      toast(e.message);
+    }
+  });
+
+  if (logsSentinel && "IntersectionObserver" in window) {
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const ent of entries) {
+          if (ent.isIntersecting) refreshLogs(false);
+        }
+      },
+      { root: null, rootMargin: "300px", threshold: 0.01 }
     );
-    renderLogs(rows);
-    logsOffset += rows.length;
-    if (!rows || rows.length < LOG_PAGE_SIZE) logsDone = true;
-  } catch (e) {
-    if (isUnauthorized(e)) return;
-    toast(e.message);
-  } finally {
-    logsLoading = false;
+    io.observe(logsSentinel);
   }
+
+  refreshLogs(true);
 }
 
-async function refreshLogs(reset = true) {
-  // Refresh logs, optionally resetting pagination state.
-  //
-  // We hash the current filter into `logsQueryKey`; when filters change we reset
-  // offset and clear the table.
-  const key = JSON.stringify(currentLogsQuery());
-  if (reset || key !== logsQueryKey) {
-    logsQueryKey = key;
-    logsOffset = 0;
-    logsLoading = false;
-    logsDone = false;
-    logsTableBody.innerHTML = "";
+function initStatsPage() {
+  const statsCard = document.getElementById("statsCard");
+  if (!statsCard) return;
+
+  const refreshBtn = document.getElementById("refreshStats");
+  const statTotal = document.getElementById("statTotal");
+  const statHit = document.getElementById("statHit");
+  const statRate = document.getElementById("statRate");
+  const statAvg = document.getElementById("statAvg");
+
+  function fmtPct(x) {
+    return `${(x * 100).toFixed(2)}%`;
   }
-  await loadMoreLogs();
+
+  async function refreshStats() {
+    try {
+      const s = await api("/stats");
+      statTotal.textContent = String(s.total ?? 0);
+      statHit.textContent = String(s.cache_hit ?? 0);
+      statRate.textContent = fmtPct(Number(s.hit_rate ?? 0));
+      const avg = Number(s.avg_latency_ms ?? 0);
+      statAvg.textContent = `${avg.toFixed(2)} ms`;
+    } catch (e) {
+      if (isUnauthorized(e)) return;
+      toast(e.message);
+    }
+  }
+
+  refreshBtn.addEventListener("click", refreshStats);
+  refreshStats();
+
+  initCacheCard();
 }
 
-refreshLogsBtn.addEventListener("click", () => refreshLogs(true));
-cleanupLogsBtn.addEventListener("click", async () => {
-  try {
-    const res = await api("/cleanup", { method: "POST", body: "{}" });
-    toast(`已删除 ${res.deleted} 条`);
-    await refreshLogs(true);
-  } catch (e) {
-    if (isUnauthorized(e)) return;
-    toast(e.message);
+function initCacheCard() {
+  const cacheCard = document.getElementById("cacheCard");
+  if (!cacheCard) return;
+
+  const refreshBtn = document.getElementById("refreshCache");
+  const metaEl = document.getElementById("cacheMeta");
+  const tbody = document.querySelector("#cacheTable tbody");
+  const sentinel = document.getElementById("cacheSentinel");
+
+  const PAGE_SIZE = 200;
+  let offset = 0;
+  let loading = false;
+  let done = false;
+  let total = 0;
+
+  function fmtTs(unixMs) {
+    if (!unixMs && unixMs !== 0) return "";
+    const d = new Date(Number(unixMs));
+    if (Number.isNaN(d.getTime())) return "";
+    return new Intl.DateTimeFormat(undefined, {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false,
+    }).format(d);
   }
-});
+
+  function render(items) {
+    for (const it of items) {
+      const tr = document.createElement("tr");
+      const ttl = Number(it.remaining_ttl_secs ?? 0);
+      const stale = Number(it.remaining_stale_secs ?? 0);
+      tr.innerHTML = `
+        <td>${escapeHtml(it.qname || "")}</td>
+        <td>${escapeHtml(it.qtype_name || String(it.qtype || ""))}</td>
+        <td>${escapeHtml(it.state || "")}</td>
+        <td>${ttl}</td>
+        <td>${stale}</td>
+        <td title="${escapeHtml(String(it.expires_unix_ms))}">${escapeHtml(fmtTs(it.expires_unix_ms))}</td>
+      `;
+      tbody.appendChild(tr);
+    }
+  }
+
+  async function loadMore() {
+    if (loading || done) return;
+    loading = true;
+    try {
+      const res = await api(`/cache${qs({ limit: PAGE_SIZE, offset })}`);
+      total = Number(res.total ?? total);
+      const items = Array.isArray(res.items) ? res.items : [];
+      render(items);
+      offset += items.length;
+      if (metaEl) metaEl.textContent = `共 ${total} 条，已加载 ${offset} 条`;
+      if (items.length < PAGE_SIZE) done = true;
+    } catch (e) {
+      if (isUnauthorized(e)) return;
+      toast(e.message);
+    } finally {
+      loading = false;
+    }
+  }
+
+  async function refresh(reset = true) {
+    if (reset) {
+      offset = 0;
+      loading = false;
+      done = false;
+      total = 0;
+      tbody.innerHTML = "";
+      if (metaEl) metaEl.textContent = "";
+    }
+    await loadMore();
+  }
+
+  if (refreshBtn) refreshBtn.addEventListener("click", () => refresh(true));
+
+  if (sentinel && "IntersectionObserver" in window) {
+    const io = new IntersectionObserver(
+      (entries) => {
+        for (const ent of entries) {
+          if (ent.isIntersecting) refresh(false);
+        }
+      },
+      { root: null, rootMargin: "300px", threshold: 0.01 }
+    );
+    io.observe(sentinel);
+  }
+
+  refresh(true);
+}
 
 // Escape user/content values before inserting into innerHTML.
 function escapeHtml(s) {
@@ -383,19 +542,10 @@ function formatTsLocal(ts) {
   }).format(d);
 }
 
-// initial load
-refreshRules();
-refreshLogs(true);
-
-if (logsSentinel && "IntersectionObserver" in window) {
-  // Infinite scroll for logs: when the sentinel reaches the viewport, fetch next page.
-  const io = new IntersectionObserver(
-    (entries) => {
-      for (const ent of entries) {
-        if (ent.isIntersecting) refreshLogs(false);
-      }
-    },
-    { root: null, rootMargin: "300px", threshold: 0.01 }
-  );
-  io.observe(logsSentinel);
-}
+document.addEventListener("DOMContentLoaded", () => {
+  initNavActive();
+  initAuth();
+  initStatsPage();
+  initRulesPage();
+  initLogsPage();
+});

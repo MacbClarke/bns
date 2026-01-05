@@ -324,6 +324,30 @@ impl Store {
 
         Ok(out)
     }
+
+    /// Get aggregated statistics since a unix millisecond timestamp (inclusive).
+    ///
+    /// This is used by the WebUI stats page to compute "last 24h" metrics.
+    pub fn stats_since(&self, since_unix_ms: i64) -> anyhow::Result<QueryStats> {
+        let conn = self.conn.lock().unwrap();
+        let (total, cache_hit, avg_latency): (i64, i64, Option<f64>) = conn.query_row(
+            r#"
+            SELECT
+              COUNT(1) AS total,
+              COALESCE(SUM(cache_hit), 0) AS cache_hit,
+              AVG(latency_ms) AS avg_latency_ms
+            FROM query_log
+            WHERE ts_unix_ms >= ?1
+            "#,
+            params![since_unix_ms],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        Ok(QueryStats {
+            total,
+            cache_hit,
+            avg_latency_ms: avg_latency.unwrap_or(0.0),
+        })
+    }
 }
 
 /// Borrowed query log row for insertion.
@@ -359,6 +383,24 @@ pub struct QueryLogRow {
     pub rule_hit: bool,
     pub upstream: Option<String>,
     pub answers_json: Option<String>,
+}
+
+/// Aggregated statistics for a time window.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct QueryStats {
+    pub total: i64,
+    pub cache_hit: i64,
+    pub avg_latency_ms: f64,
+}
+
+impl QueryStats {
+    pub fn hit_rate(&self) -> f64 {
+        if self.total <= 0 {
+            0.0
+        } else {
+            (self.cache_hit as f64) / (self.total as f64)
+        }
+    }
 }
 
 /// Convert rule match kind into the canonical DB string.

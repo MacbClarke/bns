@@ -292,7 +292,10 @@ async fn handle_query(
     let start = Instant::now();
     let client_ip = match peer.ip() {
         IpAddr::V4(v4) => v4.to_string(),
-        IpAddr::V6(v6) => v6.to_string(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4()
+            .map(|v4| v4.to_string())
+            .unwrap_or_else(|| v6.to_string()),
     };
 
     let req = match Message::from_vec(&packet) {

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>BNS Admin - 统计</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title">BNS 管理</div>
+      <nav class="nav">
+        <a href="/stats.html" data-nav="stats">统计</a>
+        <a href="/rules.html" data-nav="rules">规则</a>
+        <a href="/logs.html" data-nav="logs">查询日志</a>
+      </nav>
+      <div class="auth">
+        <input id="token" type="password" placeholder="Admin token（Bearer）" />
+        <button id="saveToken">保存</button>
+        <span id="authError" class="authError" style="display:none;"></span>
+        <span id="authStatus" class="authStatus" style="display:none;"></span>
+      </div>
+    </header>
+
+    <main>
+      <section class="card" id="statsCard">
+        <h2>最近 24 小时统计</h2>
+        <div class="actions">
+          <button id="refreshStats">刷新</button>
+        </div>
+        <div class="kvGrid">
+          <div class="kv"><div class="k">总请求数</div><div class="v" id="statTotal">-</div></div>
+          <div class="kv"><div class="k">缓存命中数</div><div class="v" id="statHit">-</div></div>
+          <div class="kv"><div class="k">命中率</div><div class="v" id="statRate">-</div></div>
+          <div class="kv"><div class="k">平均响应时间</div><div class="v" id="statAvg">-</div></div>
+        </div>
+      </section>
+
+      <section class="card" id="cacheCard">
+        <h2>内存缓存</h2>
+        <div class="actions">
+          <button id="refreshCache">刷新</button>
+          <div class="muted" id="cacheMeta"></div>
+        </div>
+        <div class="tableWrap">
+          <table id="cacheTable">
+            <thead>
+              <tr>
+                <th>qname</th>
+                <th>qtype</th>
+                <th>state</th>
+                <th>ttl(s)</th>
+                <th>stale(s)</th>
+                <th>expires</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="cacheSentinel" style="height:1px;"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

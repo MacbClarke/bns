@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>BNS Admin - 查询日志</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="title">BNS 管理</div>
+      <nav class="nav">
+        <a href="/stats.html" data-nav="stats">统计</a>
+        <a href="/rules.html" data-nav="rules">规则</a>
+        <a href="/logs.html" data-nav="logs">查询日志</a>
+      </nav>
+      <div class="auth">
+        <input id="token" type="password" placeholder="Admin token（Bearer）" />
+        <button id="saveToken">保存</button>
+        <span id="authError" class="authError" style="display:none;"></span>
+        <span id="authStatus" class="authStatus" style="display:none;"></span>
+      </div>
+    </header>
+
+    <main>
+      <section class="card" id="logsCard">
+        <h2>查询日志</h2>
+        <div class="grid">
+          <label>from
+            <input id="logFromTs" type="datetime-local" />
+          </label>
+          <label>to
+            <input id="logToTs" type="datetime-local" />
+          </label>
+          <label>qname like
+            <input id="logQnameLike" placeholder="%example.com.%" />
+          </label>
+          <label>client ip
+            <input id="logClientIp" placeholder="192.168.1.10" />
+          </label>
+          <div class="actions">
+            <button id="refreshLogs">刷新</button>
+            <button id="cleanupLogs">按保留天数清理</button>
+          </div>
+        </div>
+        <div class="tableWrap">
+          <table id="logsTable">
+            <thead>
+              <tr>
+                <th>时间</th>
+                <th>客户端</th>
+                <th>传输</th>
+                <th>qname</th>
+                <th>qtype</th>
+                <th>rcode</th>
+                <th>ms</th>
+                <th>cache</th>
+                <th>rule</th>
+                <th>upstream</th>
+                <th>answers</th>
+              </tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <div id="logsSentinel" style="height:1px;"></div>
+      </section>
+    </main>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
+

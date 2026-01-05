@@ -28,6 +28,21 @@ header {
   background: var(--bg);
 }
 .title { font-weight: 700; letter-spacing: .5px; }
+.nav {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.nav a {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+}
+.nav a:hover { background: #f9fafb; border-color: var(--border); color: var(--text); }
+.nav a.active { color: var(--text); background: #f3f4f6; border-color: var(--border); }
 .auth { display: flex; gap: 8px; align-items: center; flex-wrap: nowrap; }
 .auth input {
   width: auto;
@@ -130,6 +145,21 @@ table {
   gap: 8px;
   align-items: center;
 }
+
+.muted { color: var(--muted); font-size: 13px; }
+.kvGrid {
+  margin-top: 12px;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+.kv {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px;
+}
+.kv .k { color: var(--muted); font-size: 12px; }
+.kv .v { font-size: 18px; font-weight: 700; margin-top: 6px; }
 th, td {
   padding: 10px 10px;
   border-bottom: 1px solid var(--border);

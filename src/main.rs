@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
     let web_server = web::WebServer::new(web::WebServerDeps {
         admin: config.admin.clone(),
         retention_days: config.storage.retention_days,
+        cache: cache.clone(),
         store: store.clone(),
         rules: rules.clone(),
     });
