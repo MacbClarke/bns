@@ -40,6 +40,10 @@
         <h2>内存缓存</h2>
         <div class="actions">
           <button id="refreshCache">刷新</button>
+          <label class="checkbox">
+            <input id="cacheHideExpired" type="checkbox" />
+            <span>隐藏 expired</span>
+          </label>
           <div class="muted" id="cacheMeta"></div>
         </div>
         <div class="tableWrap">
@@ -57,7 +61,6 @@
             <tbody></tbody>
           </table>
         </div>
-        <div id="cacheSentinel" style="height:1px;"></div>
       </section>
     </main>
 

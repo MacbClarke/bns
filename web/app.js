@@ -227,10 +227,10 @@ function initLogsPage() {
   const logClientIp = document.getElementById("logClientIp");
 
   const LOG_PAGE_SIZE = 200;
-  let logsOffset = 0;
   let logsLoading = false;
   let logsDone = false;
   let logsQueryKey = "";
+  let logsCursor = null;
 
   function renderLogs(rows) {
     for (const r of rows) {
@@ -272,15 +272,24 @@ function initLogsPage() {
     logsLoading = true;
     try {
       const base = currentLogsQuery();
+      const cursorParams =
+        logsCursor && typeof logsCursor.ts_unix_ms === "number" && typeof logsCursor.id === "number"
+          ? { before_ts_unix_ms: logsCursor.ts_unix_ms, before_id: logsCursor.id }
+          : {};
       const rows = await api(
         `/logs${qs({
           ...base,
           limit: LOG_PAGE_SIZE,
-          offset: logsOffset,
+          ...cursorParams,
         })}`
       );
       renderLogs(rows);
-      logsOffset += rows.length;
+      if (rows && rows.length) {
+        const last = rows[rows.length - 1];
+        if (last && typeof last.ts_unix_ms === "number" && typeof last.id === "number") {
+          logsCursor = { ts_unix_ms: last.ts_unix_ms, id: last.id };
+        }
+      }
       if (!rows || rows.length < LOG_PAGE_SIZE) logsDone = true;
     } catch (e) {
       if (isUnauthorized(e)) return;
@@ -294,9 +303,9 @@ function initLogsPage() {
     const key = JSON.stringify(currentLogsQuery());
     if (reset || key !== logsQueryKey) {
       logsQueryKey = key;
-      logsOffset = 0;
       logsLoading = false;
       logsDone = false;
+      logsCursor = null;
       logsTableBody.innerHTML = "";
     }
     await loadMoreLogs();
@@ -368,15 +377,29 @@ function initCacheCard() {
   if (!cacheCard) return;
 
   const refreshBtn = document.getElementById("refreshCache");
+  const hideExpiredEl = document.getElementById("cacheHideExpired");
   const metaEl = document.getElementById("cacheMeta");
   const tbody = document.querySelector("#cacheTable tbody");
-  const sentinel = document.getElementById("cacheSentinel");
 
-  const PAGE_SIZE = 200;
-  let offset = 0;
+  const CACHE_LIMIT = 5000;
+  const HIDE_EXPIRED_KEY = "bns_cache_hide_expired";
   let loading = false;
-  let done = false;
   let total = 0;
+  let shown = 0;
+  let lastItems = [];
+
+  function hideExpiredEnabled() {
+    return Boolean(hideExpiredEl?.checked);
+  }
+
+  if (hideExpiredEl) {
+    const saved = localStorage.getItem(HIDE_EXPIRED_KEY);
+    hideExpiredEl.checked = saved == null ? true : saved === "1";
+    hideExpiredEl.addEventListener("change", () => {
+      localStorage.setItem(HIDE_EXPIRED_KEY, hideExpiredEl.checked ? "1" : "0");
+      render();
+    });
+  }
 
   function fmtTs(unixMs) {
     if (!unixMs && unixMs !== 0) return "";
@@ -393,8 +416,11 @@ function initCacheCard() {
     }).format(d);
   }
 
-  function render(items) {
-    for (const it of items) {
+  function render() {
+    shown = 0;
+    tbody.innerHTML = "";
+    for (const it of lastItems) {
+      if (hideExpiredEnabled() && String(it.state || "") === "expired") continue;
       const tr = document.createElement("tr");
       const ttl = Number(it.remaining_ttl_secs ?? 0);
       const stale = Number(it.remaining_stale_secs ?? 0);
@@ -407,20 +433,25 @@ function initCacheCard() {
         <td title="${escapeHtml(String(it.expires_unix_ms))}">${escapeHtml(fmtTs(it.expires_unix_ms))}</td>
       `;
       tbody.appendChild(tr);
+      shown += 1;
+    }
+
+    if (metaEl) {
+      const loaded = Array.isArray(lastItems) ? lastItems.length : 0;
+      metaEl.textContent = hideExpiredEnabled()
+        ? `共 ${total} 条，已加载 ${loaded} 条（显示 ${shown} 条）`
+        : `共 ${total} 条，已加载 ${loaded} 条`;
     }
   }
 
-  async function loadMore() {
-    if (loading || done) return;
+  async function refresh() {
+    if (loading) return;
     loading = true;
     try {
-      const res = await api(`/cache${qs({ limit: PAGE_SIZE, offset })}`);
-      total = Number(res.total ?? total);
-      const items = Array.isArray(res.items) ? res.items : [];
-      render(items);
-      offset += items.length;
-      if (metaEl) metaEl.textContent = `共 ${total} 条，已加载 ${offset} 条`;
-      if (items.length < PAGE_SIZE) done = true;
+      const res = await api(`/cache${qs({ limit: CACHE_LIMIT, offset: 0 })}`);
+      total = Number(res.total ?? 0);
+      lastItems = Array.isArray(res.items) ? res.items : [];
+      render();
     } catch (e) {
       if (isUnauthorized(e)) return;
       toast(e.message);
@@ -429,33 +460,8 @@ function initCacheCard() {
     }
   }
 
-  async function refresh(reset = true) {
-    if (reset) {
-      offset = 0;
-      loading = false;
-      done = false;
-      total = 0;
-      tbody.innerHTML = "";
-      if (metaEl) metaEl.textContent = "";
-    }
-    await loadMore();
-  }
-
-  if (refreshBtn) refreshBtn.addEventListener("click", () => refresh(true));
-
-  if (sentinel && "IntersectionObserver" in window) {
-    const io = new IntersectionObserver(
-      (entries) => {
-        for (const ent of entries) {
-          if (ent.isIntersecting) refresh(false);
-        }
-      },
-      { root: null, rootMargin: "300px", threshold: 0.01 }
-    );
-    io.observe(sentinel);
-  }
-
-  refresh(true);
+  if (refreshBtn) refreshBtn.addEventListener("click", () => refresh());
+  refresh();
 }
 
 // Escape user/content values before inserting into innerHTML.

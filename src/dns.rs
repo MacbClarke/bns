@@ -39,7 +39,7 @@ use crate::{
     config::{Config, UpstreamPolicy},
     inflight::InFlight,
     rules::{RuleAnswer, RuleSet, RuleType},
-    store::{QueryLogEntry, Store},
+    store::{QueryLogInsert, Store},
 };
 
 /// Dependencies shared by all DNS handlers.
@@ -80,7 +80,7 @@ impl DnsServer {
     /// Each UDP packet is handled in its own task; each TCP connection is
     /// handled in its own task.
     pub async fn run(self, shutdown: watch::Receiver<bool>) -> anyhow::Result<()> {
-        let (log_tx, log_rx) = mpsc::channel::<LogEvent>(50_000);
+        let (log_tx, log_rx) = mpsc::channel::<QueryLogInsert>(50_000);
         self.spawn_log_worker(log_rx, shutdown.clone());
 
         let mut tasks = Vec::new();
@@ -122,12 +122,13 @@ impl DnsServer {
     /// - Cleanup (retention) is executed at most once per hour.
     fn spawn_log_worker(
         &self,
-        mut log_rx: mpsc::Receiver<LogEvent>,
+        mut log_rx: mpsc::Receiver<QueryLogInsert>,
         shutdown: watch::Receiver<bool>,
     ) {
         let store = self.deps.store.clone();
         let retention_days = self.deps.config.storage.retention_days;
         tokio::spawn(async move {
+            const BATCH_MAX: usize = 2000;
             let mut last_cleanup = Instant::now();
             let shutdown = shutdown;
             loop {
@@ -135,8 +136,18 @@ impl DnsServer {
                     _ = crate::shutdown::wait(shutdown.clone()) => break,
                     ev = log_rx.recv() => {
                         let Some(ev) = ev else { break };
+                        let mut batch = Vec::with_capacity(256);
+                        batch.push(ev);
+                        while batch.len() < BATCH_MAX {
+                            match log_rx.try_recv() {
+                                Ok(ev2) => batch.push(ev2),
+                                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+                            }
+                        }
+
                         let store_for_insert = store.clone();
-                        tokio::task::spawn_blocking(move || store_for_insert.insert_query_log(ev.as_entry()))
+                        tokio::task::spawn_blocking(move || store_for_insert.insert_query_logs_batch(&batch))
                             .await
                             .ok();
 
@@ -175,7 +186,7 @@ impl Clone for DnsServerDeps {
 async fn run_udp(
     socket: Arc<UdpSocket>,
     deps: DnsServerDeps,
-    log_tx: mpsc::Sender<LogEvent>,
+    log_tx: mpsc::Sender<QueryLogInsert>,
     rr_counter: Arc<AtomicUsize>,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -207,7 +218,7 @@ async fn run_udp(
 async fn run_tcp(
     listener: TcpListener,
     deps: DnsServerDeps,
-    log_tx: mpsc::Sender<LogEvent>,
+    log_tx: mpsc::Sender<QueryLogInsert>,
     rr_counter: Arc<AtomicUsize>,
     shutdown: watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
@@ -237,7 +248,7 @@ async fn handle_tcp_client(
     mut stream: TcpStream,
     peer: SocketAddr,
     deps: DnsServerDeps,
-    log_tx: mpsc::Sender<LogEvent>,
+    log_tx: mpsc::Sender<QueryLogInsert>,
     rr_counter: Arc<AtomicUsize>,
 ) -> anyhow::Result<()> {
     loop {
@@ -288,7 +299,7 @@ async fn handle_query(
     peer: SocketAddr,
     transport: &'static str,
     deps: DnsServerDeps,
-    log_tx: mpsc::Sender<LogEvent>,
+    log_tx: mpsc::Sender<QueryLogInsert>,
     rr_counter: Arc<AtomicUsize>,
 ) -> Option<Vec<u8>> {
     let start = Instant::now();
@@ -369,11 +380,11 @@ async fn handle_query(
     if let (Some(ts), Ok(msg)) = (ts, Message::from_vec(&response)) {
         let rcode = format!("{:?}", msg.response_code());
         let answers_json = summarize_answers_json(&msg).ok();
-        let ev = LogEvent {
+        let _ = log_tx.try_send(QueryLogInsert {
             ts,
             ts_unix_ms,
             client_ip,
-            transport,
+            transport: transport.to_string(),
             qname: crate::rules::normalize_name(&qname),
             qtype: format!("{:?}", qtype),
             rcode,
@@ -382,8 +393,7 @@ async fn handle_query(
             rule_hit,
             upstream: upstream_used,
             answers_json,
-        };
-        let _ = log_tx.try_send(ev);
+        });
     }
 
     Some(response)
@@ -642,40 +652,4 @@ fn summarize_answers_json(msg: &Message) -> anyhow::Result<String> {
     Ok(serde_json::to_string(&out)?)
 }
 
-/// A single query log event sent from the request path to the background log worker.
-///
-/// The `ts_unix_ms` field is used for stable numeric range filtering.
-struct LogEvent {
-    ts: String,
-    ts_unix_ms: i64,
-    client_ip: String,
-    transport: &'static str,
-    qname: String,
-    qtype: String,
-    rcode: String,
-    latency_ms: i64,
-    cache_hit: bool,
-    rule_hit: bool,
-    upstream: Option<String>,
-    answers_json: Option<String>,
-}
-
-impl LogEvent {
-    /// Convert to the SQLite insertion struct (borrowed fields).
-    fn as_entry(&self) -> QueryLogEntry<'_> {
-        QueryLogEntry {
-            ts: &self.ts,
-            ts_unix_ms: self.ts_unix_ms,
-            client_ip: &self.client_ip,
-            transport: self.transport,
-            qname: &self.qname,
-            qtype: &self.qtype,
-            rcode: &self.rcode,
-            latency_ms: self.latency_ms,
-            cache_hit: self.cache_hit,
-            rule_hit: self.rule_hit,
-            upstream: self.upstream.as_deref(),
-            answers_json: self.answers_json.as_deref(),
-        }
-    }
-}
+// Query logs are sent as `QueryLogInsert` into a bounded channel; if full, logs are dropped.

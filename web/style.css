@@ -119,6 +119,7 @@ label {
   gap: 8px;
   grid-column: 1 / -1;
   flex-wrap: wrap;
+  align-items: center;
 }
 .checkbox {
   display: flex;

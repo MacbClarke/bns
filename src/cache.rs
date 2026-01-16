@@ -222,8 +222,8 @@ impl DnsCache {
     /// Insert/replace a cache entry.
     ///
     /// The provided TTL is clamped to `[min_ttl, max_ttl]` (and forced to >= 1).
-    /// If SWR is enabled, the stale window is set to `expires_at + stale_max_age`
-    /// (or derived from hit frequency when `adaptive_stale` is enabled).
+    /// If SWR is enabled, the stale window is derived from hit frequency, and
+    /// bounded by `stale_min_age..=stale_max_age`.
     pub fn put(&self, key: CacheKey, response: &[u8], ttl_secs: u64) {
         let ttl_secs = ttl_secs.clamp(self.cfg.min_ttl, self.cfg.max_ttl).max(1);
         let now = OffsetDateTime::now_utc();

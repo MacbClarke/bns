@@ -230,29 +230,40 @@ impl Store {
         Ok(())
     }
 
-    /// Insert a DNS query log row.
-    pub fn insert_query_log(&self, entry: QueryLogEntry<'_>) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            r#"
-            INSERT INTO query_log(ts, ts_unix_ms, client_ip, transport, qname, qtype, rcode, latency_ms, cache_hit, rule_hit, upstream, answers)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-            "#,
-            params![
-                entry.ts,
-                entry.ts_unix_ms,
-                entry.client_ip,
-                entry.transport,
-                entry.qname,
-                entry.qtype,
-                entry.rcode,
-                entry.latency_ms,
-                if entry.cache_hit { 1 } else { 0 },
-                if entry.rule_hit { 1 } else { 0 },
-                entry.upstream,
-                entry.answers_json,
-            ],
-        )?;
+    /// Insert multiple DNS query log rows in a single transaction.
+    ///
+    /// This is significantly faster than per-row inserts under high QPS.
+    pub fn insert_query_logs_batch(&self, entries: &[QueryLogInsert]) -> anyhow::Result<()> {
+        if entries.is_empty() {
+            return Ok(());
+        }
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                r#"
+                INSERT INTO query_log(ts, ts_unix_ms, client_ip, transport, qname, qtype, rcode, latency_ms, cache_hit, rule_hit, upstream, answers)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                "#,
+            )?;
+            for e in entries {
+                stmt.execute(params![
+                    e.ts,
+                    e.ts_unix_ms,
+                    e.client_ip,
+                    e.transport,
+                    e.qname,
+                    e.qtype,
+                    e.rcode,
+                    e.latency_ms,
+                    if e.cache_hit { 1 } else { 0 },
+                    if e.rule_hit { 1 } else { 0 },
+                    e.upstream,
+                    e.answers_json,
+                ])?;
+            }
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -278,7 +289,8 @@ impl Store {
     /// - `client_ip`: exact string match.
     ///
     /// Pagination:
-    /// - `limit` and `offset` are applied after filtering and sorting by newest first.
+    /// - Prefer cursor paging (`before_ts_unix_ms` + `before_id`) for stable infinite scroll.
+    /// - If cursor is not provided, `offset` is applied after filtering and sorting by newest first.
     pub fn list_query_logs(
         &self,
         from_ts: Option<&str>,
@@ -287,11 +299,13 @@ impl Store {
         client_ip: Option<&str>,
         limit: u32,
         offset: u32,
+        before_ts_unix_ms: Option<i64>,
+        before_id: Option<i64>,
     ) -> anyhow::Result<Vec<QueryLogRow>> {
         let conn = self.conn.lock().unwrap();
 
         let mut sql = String::from(
-            "SELECT id, ts, client_ip, transport, qname, qtype, rcode, latency_ms, cache_hit, rule_hit, upstream, answers FROM query_log WHERE 1=1",
+            "SELECT id, ts, ts_unix_ms, client_ip, transport, qname, qtype, rcode, latency_ms, cache_hit, rule_hit, upstream, answers FROM query_log WHERE 1=1",
         );
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
 
@@ -312,9 +326,23 @@ impl Store {
             args.push(rusqlite::types::Value::Text(v.to_string()));
         }
 
-        sql.push_str(" ORDER BY ts_unix_ms DESC LIMIT ? OFFSET ?");
+        // Cursor paging: stable under concurrent inserts.
+        if let (Some(ts), Some(id)) = (before_ts_unix_ms, before_id) {
+            sql.push_str(" AND (ts_unix_ms < ? OR (ts_unix_ms = ? AND id < ?))");
+            args.push(ts.into());
+            args.push(ts.into());
+            args.push(id.into());
+        }
+
+        if before_ts_unix_ms.is_some() && before_id.is_some() {
+            sql.push_str(" ORDER BY ts_unix_ms DESC, id DESC LIMIT ?");
+        } else {
+            sql.push_str(" ORDER BY ts_unix_ms DESC, id DESC LIMIT ? OFFSET ?");
+        }
         args.push((limit as i64).into());
-        args.push((offset as i64).into());
+        if !(before_ts_unix_ms.is_some() && before_id.is_some()) {
+            args.push((offset as i64).into());
+        }
 
         let mut stmt = conn.prepare(&sql)?;
         let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
@@ -324,16 +352,17 @@ impl Store {
             out.push(QueryLogRow {
                 id: row.get(0)?,
                 ts: row.get(1)?,
-                client_ip: row.get(2)?,
-                transport: row.get(3)?,
-                qname: row.get(4)?,
-                qtype: row.get(5)?,
-                rcode: row.get(6)?,
-                latency_ms: row.get(7)?,
-                cache_hit: row.get::<_, i64>(8)? != 0,
-                rule_hit: row.get::<_, i64>(9)? != 0,
-                upstream: row.get(10)?,
-                answers_json: row.get(11)?,
+                ts_unix_ms: row.get(2)?,
+                client_ip: row.get(3)?,
+                transport: row.get(4)?,
+                qname: row.get(5)?,
+                qtype: row.get(6)?,
+                rcode: row.get(7)?,
+                latency_ms: row.get(8)?,
+                cache_hit: row.get::<_, i64>(9)? != 0,
+                rule_hit: row.get::<_, i64>(10)? != 0,
+                upstream: row.get(11)?,
+                answers_json: row.get(12)?,
             });
         }
 
@@ -365,22 +394,21 @@ impl Store {
     }
 }
 
-/// Borrowed query log row for insertion.
-///
-/// `ts` is RFC3339 for readability; `ts_unix_ms` is used for stable numeric filtering.
-pub struct QueryLogEntry<'a> {
-    pub ts: &'a str,
+/// Owned query log row for insertion (used by the async log worker).
+#[derive(Debug, Clone)]
+pub struct QueryLogInsert {
+    pub ts: String,
     pub ts_unix_ms: i64,
-    pub client_ip: &'a str,
-    pub transport: &'a str,
-    pub qname: &'a str,
-    pub qtype: &'a str,
-    pub rcode: &'a str,
+    pub client_ip: String,
+    pub transport: String,
+    pub qname: String,
+    pub qtype: String,
+    pub rcode: String,
     pub latency_ms: i64,
     pub cache_hit: bool,
     pub rule_hit: bool,
-    pub upstream: Option<&'a str>,
-    pub answers_json: Option<&'a str>,
+    pub upstream: Option<String>,
+    pub answers_json: Option<String>,
 }
 
 /// Returned query log row (for API/UI).
@@ -388,6 +416,7 @@ pub struct QueryLogEntry<'a> {
 pub struct QueryLogRow {
     pub id: i64,
     pub ts: String,
+    pub ts_unix_ms: i64,
     pub client_ip: String,
     pub transport: String,
     pub qname: String,

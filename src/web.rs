@@ -299,6 +299,9 @@ struct LogsQuery {
     to_ts: Option<String>,
     qname_like: Option<String>,
     client_ip: Option<String>,
+    /// Cursor paging: fetch rows older than this `(ts_unix_ms, id)` pair.
+    before_ts_unix_ms: Option<i64>,
+    before_id: Option<i64>,
     #[serde(default = "default_limit")]
     limit: u32,
     #[serde(default)]
@@ -325,6 +328,8 @@ async fn api_logs_list(
             q.client_ip.as_deref(),
             q.limit.min(2000),
             q.offset,
+            q.before_ts_unix_ms,
+            q.before_id,
         )
     })
     .await
