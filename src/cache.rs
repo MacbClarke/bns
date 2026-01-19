@@ -70,6 +70,10 @@ pub enum CacheEntryState {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct CacheSnapshot {
     pub total: usize,
+    /// Number of entries scanned (starting from the requested offset).
+    pub scanned: usize,
+    /// Whether scanning stopped early due to `scan_limit`.
+    pub truncated: bool,
     pub items: Vec<CacheEntryInfo>,
 }
 
@@ -171,21 +175,40 @@ impl DnsCache {
     /// Snapshot cache keys and entry metadata for inspection in the admin UI.
     ///
     /// This does not include response bytes, and it is safe to call even with a
-    /// large cache, but it is still O(n) w.r.t. `offset + limit` because we must
+    /// large cache, but it is still O(n) w.r.t. `offset + scanned` because we must
     /// iterate the LRU to reach the requested page.
-    pub fn snapshot(&self, offset: usize, limit: usize) -> CacheSnapshot {
+    ///
+    /// When filters are enabled (e.g. hide expired or qname substring match), we may
+    /// need to scan more than `limit` entries to collect `limit` results, so callers
+    /// should keep `scan_limit` reasonably small to avoid blocking cache operations.
+    pub fn snapshot(
+        &self,
+        offset: usize,
+        limit: usize,
+        scan_limit: usize,
+        hide_expired: bool,
+        qname_like: Option<&str>,
+    ) -> CacheSnapshot {
         let now = OffsetDateTime::now_utc();
         let cache = self.inner.lock().unwrap();
         let total = cache.len();
         let mut items = Vec::with_capacity(limit.min(1000));
+        let qname_like = qname_like
+            .map(|s| s.trim().to_ascii_lowercase())
+            .filter(|s| !s.is_empty());
+        let scan_limit = scan_limit.max(limit).max(1);
+        let mut scanned = 0usize;
+        let mut truncated = false;
 
         for (idx, (k, v)) in cache.iter().enumerate() {
             if idx < offset {
                 continue;
             }
-            if items.len() >= limit {
+            if scanned >= scan_limit {
+                truncated = true;
                 break;
             }
+            scanned += 1;
 
             let state = if v.expires_at > now {
                 CacheEntryState::Fresh
@@ -194,6 +217,16 @@ impl DnsCache {
             } else {
                 CacheEntryState::Expired
             };
+
+            if hide_expired && matches!(state, CacheEntryState::Expired) {
+                continue;
+            }
+            if let Some(substr) = qname_like.as_deref() {
+                // qname in cache keys is normalized to lowercase + trailing dot.
+                if !k.qname.contains(substr) {
+                    continue;
+                }
+            }
 
             let expires_unix_ms: i64 = (v.expires_at.unix_timestamp_nanos() / 1_000_000)
                 .try_into()
@@ -214,9 +247,18 @@ impl DnsCache {
                 remaining_ttl_secs,
                 remaining_stale_secs,
             });
+
+            if items.len() >= limit {
+                break;
+            }
         }
 
-        CacheSnapshot { total, items }
+        CacheSnapshot {
+            total,
+            scanned,
+            truncated,
+            items,
+        }
     }
 
     /// Insert/replace a cache entry.

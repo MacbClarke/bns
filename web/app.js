@@ -377,16 +377,21 @@ function initCacheCard() {
   if (!cacheCard) return;
 
   const refreshBtn = document.getElementById("refreshCache");
+  const filterEl = document.getElementById("cacheFilter");
   const hideExpiredEl = document.getElementById("cacheHideExpired");
   const metaEl = document.getElementById("cacheMeta");
   const tbody = document.querySelector("#cacheTable tbody");
 
-  const CACHE_LIMIT = 5000;
+  const CACHE_LIMIT = 2000; // server clamps to 2000
+  const CACHE_SCAN_LIMIT = 20000; // keep small to avoid blocking cache ops
   const HIDE_EXPIRED_KEY = "bns_cache_hide_expired";
+  const CACHE_FILTER_KEY = "bns_cache_filter";
   let loading = false;
   let total = 0;
-  let shown = 0;
+  let scanned = 0;
+  let truncated = false;
   let lastItems = [];
+  let filterTimer = null;
 
   function hideExpiredEnabled() {
     return Boolean(hideExpiredEl?.checked);
@@ -397,7 +402,27 @@ function initCacheCard() {
     hideExpiredEl.checked = saved == null ? true : saved === "1";
     hideExpiredEl.addEventListener("change", () => {
       localStorage.setItem(HIDE_EXPIRED_KEY, hideExpiredEl.checked ? "1" : "0");
-      render();
+      refresh();
+    });
+  }
+
+  function filterValue() {
+    return String(filterEl?.value || "").trim();
+  }
+
+  if (filterEl) {
+    filterEl.value = localStorage.getItem(CACHE_FILTER_KEY) || "";
+    filterEl.addEventListener("input", () => {
+      if (filterTimer) clearTimeout(filterTimer);
+      filterTimer = setTimeout(() => {
+        localStorage.setItem(CACHE_FILTER_KEY, filterValue());
+        refresh();
+      }, 350);
+    });
+    filterEl.addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter") return;
+      localStorage.setItem(CACHE_FILTER_KEY, filterValue());
+      refresh();
     });
   }
 
@@ -417,10 +442,8 @@ function initCacheCard() {
   }
 
   function render() {
-    shown = 0;
     tbody.innerHTML = "";
     for (const it of lastItems) {
-      if (hideExpiredEnabled() && String(it.state || "") === "expired") continue;
       const tr = document.createElement("tr");
       const ttl = Number(it.remaining_ttl_secs ?? 0);
       const stale = Number(it.remaining_stale_secs ?? 0);
@@ -433,14 +456,17 @@ function initCacheCard() {
         <td title="${escapeHtml(String(it.expires_unix_ms))}">${escapeHtml(fmtTs(it.expires_unix_ms))}</td>
       `;
       tbody.appendChild(tr);
-      shown += 1;
     }
 
     if (metaEl) {
       const loaded = Array.isArray(lastItems) ? lastItems.length : 0;
-      metaEl.textContent = hideExpiredEnabled()
-        ? `共 ${total} 条，已加载 ${loaded} 条（显示 ${shown} 条）`
-        : `共 ${total} 条，已加载 ${loaded} 条`;
+      const filt = filterValue();
+      const bits = [`共 ${total} 条`, `已返回 ${loaded} 条`];
+      if (hideExpiredEnabled()) bits.push("已隐藏 expired");
+      if (filt) bits.push(`qname 包含 "${filt}"`);
+      if (scanned) bits.push(`已扫描 ${scanned} 条`);
+      if (truncated) bits.push("扫描已截断");
+      metaEl.textContent = bits.join("，");
     }
   }
 
@@ -448,9 +474,19 @@ function initCacheCard() {
     if (loading) return;
     loading = true;
     try {
-      const res = await api(`/cache${qs({ limit: CACHE_LIMIT, offset: 0 })}`);
+      const res = await api(
+        `/cache${qs({
+          limit: CACHE_LIMIT,
+          offset: 0,
+          hide_expired: hideExpiredEnabled() ? 1 : 0,
+          qname_like: filterValue(),
+          scan_limit: CACHE_SCAN_LIMIT,
+        })}`
+      );
       total = Number(res.total ?? 0);
       lastItems = Array.isArray(res.items) ? res.items : [];
+      scanned = Number(res.scanned ?? 0);
+      truncated = Boolean(res.truncated);
       render();
     } catch (e) {
       if (isUnauthorized(e)) return;

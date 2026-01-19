@@ -166,6 +166,19 @@ struct CacheQuery {
     limit: u32,
     #[serde(default)]
     offset: u32,
+    /// If true, do not return entries whose state is `expired`.
+    #[serde(default)]
+    hide_expired: bool,
+    /// Case-insensitive substring match against normalized qname.
+    #[serde(default)]
+    qname_like: Option<String>,
+    /// Upper bound on how many entries to scan (starting at `offset`) while collecting results.
+    #[serde(default = "default_cache_scan_limit")]
+    scan_limit: u32,
+}
+
+fn default_cache_scan_limit() -> u32 {
+    20_000
 }
 
 /// In-memory cache snapshot.
@@ -177,7 +190,14 @@ async fn api_cache(
 ) -> Result<Json<CacheSnapshot>, StatusCode> {
     let limit = q.limit.min(2000) as usize;
     let offset = q.offset as usize;
-    Ok(Json(state.cache.snapshot(offset, limit)))
+    let scan_limit = q.scan_limit.clamp(limit as u32, 20_000) as usize;
+    Ok(Json(state.cache.snapshot(
+        offset,
+        limit,
+        scan_limit,
+        q.hide_expired,
+        q.qname_like.as_deref(),
+    )))
 }
 
 #[derive(Serialize)]
