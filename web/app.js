@@ -478,7 +478,7 @@ function initCacheCard() {
         `/cache${qs({
           limit: CACHE_LIMIT,
           offset: 0,
-          hide_expired: hideExpiredEnabled() ? 1 : 0,
+          hide_expired: hideExpiredEnabled() ? "true" : "",
           qname_like: filterValue(),
           scan_limit: CACHE_SCAN_LIMIT,
         })}`
