@@ -74,10 +74,10 @@ fn default_timeout_ms() -> u64 {
     2000
 }
 
-/// Cache configuration (LRU in-memory).
+/// Cache configuration (W-TinyLFU in-memory).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CacheConfig {
-    /// Maximum number of cached entries (LRU).
+    /// Maximum number of cached entries.
     #[serde(default = "default_cache_max_entries")]
     pub max_entries: usize,
     /// Lower bound for cached TTL.

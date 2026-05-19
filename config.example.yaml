@@ -21,6 +21,7 @@ upstream_policy: "failover" # failover | round_robin | random
 timeout_ms: 2000
 
 cache:
+  # Maximum number of DNS responses kept by the in-memory W-TinyLFU cache.
   max_entries: 200000
   min_ttl: 5
   max_ttl: 86400
